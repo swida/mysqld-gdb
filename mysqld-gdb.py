@@ -10,7 +10,6 @@ mysql tablelist -- traverse TABLE_LIST list
 
 Pretty printers of structs:
 List
-memroot_deque
 mem_root_deque
 """
 from __future__ import print_function # python2.X support
@@ -26,33 +25,6 @@ def std_vector_to_list(std_vector):
     while value_reference != std_vector['_M_impl']['_M_finish']:
         out_list.append(value_reference.dereference())
         value_reference += 1
-
-    return out_list
-
-def std_deque_to_list(std_deque):
-    """convert std::deque to a list"""
-    out_list = []
-    elttype = std_deque.type.template_argument(0)
-    size = elttype.sizeof
-    if size < 512:
-        buffer_size = int (512 / size)
-    else:
-        buffer_size = 1
-
-    start = std_deque['_M_impl']['_M_start']['_M_cur']
-    end = std_deque['_M_impl']['_M_start']['_M_last']
-    node = std_deque['_M_impl']['_M_start']['_M_node']
-    last = std_deque['_M_impl']['_M_finish']['_M_cur']
-
-    p = start
-    while p != last:
-        out_list.append(p.dereference())
-        p += 1
-        if p != end:
-            continue
-        node += 1
-        p = node[0]
-        end = p + buffer_size
 
     return out_list
 
@@ -701,47 +673,6 @@ class ListPrinter(object):
     def to_string(self):
         return '%s' % self.typename if self.val['elements'] != 0 else 'empty %s' % self.typename
 
-class memroot_dequePrinter(object):
-    """Print a MySQL memroot_deque List"""
-
-    class _iterator(PrinterIterator):
-        def __init__(self, nodetype, head):
-            self.nodetype = nodetype
-            self.base = head['_M_impl']['_M_start']['_M_cur']
-            self.end = head['_M_impl']['_M_start']['_M_last']
-            self.node = head['_M_impl']['_M_start']['_M_node']
-            self.last= head['_M_impl']['_M_finish']['_M_cur']
-            self.autoncvar = AutoNumCVar()
-            self.buffer_size = 1
-            if nodetype.sizeof < 512:
-                self.buffer_size = int (512 / nodetype.sizeof)
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            if self.base == self.last:
-                raise StopIteration
-            elt = self.base.dereference()
-            self.base = self.base + 1
-            if self.base == self.end:
-                self.node = self.node + 1
-                self.base = self.node[0]
-                self.end = self.base + self.buffer_size
-            val, cvname = expr_node_value(elt.cast(self.nodetype), self.autoncvar)
-            return (cvname, '(%s) %s' % (elt.dynamic_type, val))
-
-    def __init__(self, val):
-        self.typename = val.type
-        self.val = val
-
-    def children(self):
-        nodetype = self.typename.template_argument(0)
-        return self._iterator(nodetype, self.val)
-
-    def to_string(self):
-        return '%s' % self.typename
-
 # mem_root_deque is from 8.0.22+
 class mem_root_dequePrinter(object):
     """Print a MySQL mem_root_deque List"""
@@ -783,7 +714,6 @@ def build_pretty_printer():
     pp = gdb.printing.RegexpCollectionPrettyPrinter(
         "mysqld")
     pp.add_printer('List', '^List<.*>$', ListPrinter)
-    pp.add_printer('memroot_deque', '^memroot_deque<.*>$', memroot_dequePrinter)
     pp.add_printer('mem_root_deque', '^mem_root_deque<.*>$', mem_root_dequePrinter)
     return pp
 
