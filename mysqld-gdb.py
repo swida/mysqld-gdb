@@ -138,7 +138,6 @@ class ThreadSearch(gdb.Command):
                 print(thr.num, brief_backtrace(None))
 
         old_thread.switch()
-
 ThreadSearch()
 
 class ThreadOverview(gdb.Command):
@@ -189,7 +188,6 @@ class ThreadOverview(gdb.Command):
         for nums_thr,funcs in thr_ow:
            print(','.join([str(i) for i in nums_thr]), funcs)
         old_thread.switch()
-
 ThreadOverview()
 
 class TreeWalker(object):
@@ -386,11 +384,6 @@ def print_SELECT_LEX(select_lex):
     return traverse_TABLE_LIST(leaf_tables, True)
 
 def print_SELECT_LEX_UNIT(select_lex_unit):
-    try:
-        push_down_strategy = select_lex_unit['pq_pushdown_strategy']
-        return str(push_down_strategy)
-    except gdb.error:
-        pass
     return ''
 
 # For 8.0.25+
