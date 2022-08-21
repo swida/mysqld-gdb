@@ -618,6 +618,45 @@ class SEL_TREE_traverser(gdb.Command, TreeWalker, ItemDisplayer):
 
 SEL_TREE_traverser()
 
+class AccessPathTraverser(gdb.Command, TreeWalker):
+    """explore access path tree"""
+    def __init__ (self):
+        super(self.__class__, self).__init__ ("mysql accesspath", gdb.COMMAND_OBSCURE)
+
+    def invoke(self, arg, from_tty):
+        if not arg:
+            print("usage: mysql accesspath [accesspath]")
+            return
+        accesspath = gdb.parse_and_eval(arg)
+        self.walk(accesspath)
+
+    def find_ap_struct(self, val):
+        aptype_name = str(val['type']).split('::')[1]
+        u = val['u']
+        aptype_field = None
+        for field in u.type.fields():
+            if aptype_name.casefold() != field.name.casefold():
+                continue
+            aptype_field = field
+            break
+        else:
+            raise "No access path struct found for type: %s" % aptype_name
+        return u[aptype_field]
+
+    def walk_AccessPath(self, val):
+        aptype = self.find_ap_struct(val)
+        child_aps = []
+        for field in aptype.type.fields():
+            if str(field.type) == 'AccessPath *':
+                child_aps.append(aptype[field])
+        return child_aps
+
+    def show_AccessPath(self, val):
+        aptype = self.find_ap_struct(val)
+        return str(val['type']).split('::')[1] + ' ' + self.autoncvar.set_var(aptype) + ' ' + str(aptype)
+
+AccessPathTraverser()
+
 #
 # pretty printers
 #
