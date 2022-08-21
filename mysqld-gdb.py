@@ -2,6 +2,8 @@
 commands and some pretty printers.
 
 Commands:
+thread overview -- display thread brief with backtrace aggregation
+thread search -- find a thread given a keyword of backtrace function name
 mysql digest -- decode a statement digest to readable string
 mysql item -- explore expression (Item) tree
 mysql queryblock -- explore query block tree
@@ -341,7 +343,6 @@ class ItemExpressionTraverser(gdb.Command, TreeWalker, ItemDisplayer):
             children.append(info.cast(nodetype.pointer()))
             cur_elt = cur_elt.dereference()['next']
         return children
-
 ItemExpressionTraverser()
 
 def print_TABLE_LIST(lt, autoncvar):
@@ -377,25 +378,6 @@ def traverse_TABLE_LIST(table_list, only_leaf):
         s += 'global tables: ' + global_tables
     return s
 
-def print_SELECT_LEX(select_lex):
-    """print SELECT_LEX extra information"""
-
-    leaf_tables = select_lex['leaf_tables']
-    return traverse_TABLE_LIST(leaf_tables, True)
-
-def print_SELECT_LEX_UNIT(select_lex_unit):
-    return ''
-
-# For 8.0.25+
-def print_Query_block(query_block):
-    """print Query_block extra information"""
-
-    leaf_tables = query_block['leaf_tables']
-    return traverse_TABLE_LIST(leaf_tables, True)
-
-def print_Query_expression(unit):
-    return ''
-
 class QueryBlockTraverser(gdb.Command, TreeWalker):
     """explore query block tree"""
     def __init__ (self):
@@ -403,7 +385,7 @@ class QueryBlockTraverser(gdb.Command, TreeWalker):
 
     def invoke(self, arg, from_tty):
         if not arg:
-            print("usage: mysql queryblock [SELECT_LEX_UNIT/SELECT_LEX/Query_expression/Query_block]")
+            print("usage: mysql queryblock [Query_expression/Query_block]")
             return
         qb = gdb.parse_and_eval(arg)
         self.start_qb = qb.dereference()
@@ -423,28 +405,28 @@ class QueryBlockTraverser(gdb.Command, TreeWalker):
             blocks.append(block)
         return blocks
 
-    walk_SELECT_LEX = do_walk_query_block
-    walk_SELECT_LEX_UNIT = do_walk_query_block
     walk_Query_expression = do_walk_query_block
     walk_Query_block = do_walk_query_block
+    # Support version before 8.0.24
+    walk_SELECT_LEX = do_walk_query_block
+    walk_SELECT_LEX_UNIT = do_walk_query_block
 
     def get_current_marker(self, val):
         if self.start_qb.address != val:
             return ''
         return ' <-'
 
-    def show_SELECT_LEX(self, val):
-        return print_SELECT_LEX(val) + self.get_current_marker(val)
-
-    def show_SELECT_LEX_UNIT(self, val):
-        return print_SELECT_LEX_UNIT(val) + self.get_current_marker(val)
-
     def show_Query_expression(self, val):
-        return print_Query_expression(val) + self.get_current_marker(val)
+        return self.get_current_marker(val)
 
     def show_Query_block(self, val):
-        return print_Query_block(val) + self.get_current_marker(val)
+        leaf_tables = val['leaf_tables']
+        table_list = traverse_TABLE_LIST(leaf_tables, True)
+        return table_list + self.get_current_marker(val)
 
+    # Support version before 8.0.24
+    show_SELECT_LEX = show_Query_block
+    show_SELECT_LEX_UNIT = show_Query_expression
 QueryBlockTraverser()
 
 class TABLE_LIST_traverser(gdb.Command):
@@ -455,7 +437,6 @@ class TABLE_LIST_traverser(gdb.Command):
     def invoke(self, arg, from_tty):
         table_list = gdb.parse_and_eval(arg)
         print(traverse_TABLE_LIST(table_list, False))
-
 TABLE_LIST_traverser()
 
 class SEL_TREE_traverser(gdb.Command, TreeWalker, ItemDisplayer):
@@ -615,8 +596,21 @@ class SEL_TREE_traverser(gdb.Command, TreeWalker, ItemDisplayer):
         if sel_arg_next_part:
             out_list.append(sel_arg_next_part)
         return out_list
-
 SEL_TREE_traverser()
+
+def find_access_path_struct(access_path):
+    """Find actual struct in AccessPath according to AccessPath::type"""
+    aptype_name = str(access_path['type']).split('::')[1]
+    u = access_path['u']
+    aptype_field = None
+    for field in u.type.fields():
+        if aptype_name.casefold() != field.name.casefold():
+            continue
+        aptype_field = field
+        break
+    else:
+        raise "No access path struct found for type: %s" % aptype_name
+    return aptype_field
 
 class AccessPathTraverser(gdb.Command, TreeWalker):
     """explore access path tree"""
@@ -630,21 +624,9 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
         accesspath = gdb.parse_and_eval(arg)
         self.walk(accesspath)
 
-    def find_ap_struct(self, val):
-        aptype_name = str(val['type']).split('::')[1]
-        u = val['u']
-        aptype_field = None
-        for field in u.type.fields():
-            if aptype_name.casefold() != field.name.casefold():
-                continue
-            aptype_field = field
-            break
-        else:
-            raise "No access path struct found for type: %s" % aptype_name
-        return u[aptype_field]
-
     def walk_AccessPath(self, val):
-        aptype = self.find_ap_struct(val)
+        apfield = find_access_path_struct(val)
+        aptype = val['u'][apfield]
         child_aps = []
         for field in aptype.type.fields():
             if str(field.type) == 'AccessPath *':
@@ -652,9 +634,10 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
         return child_aps
 
     def show_AccessPath(self, val):
-        aptype = self.find_ap_struct(val)
-        return str(val['type']).split('::')[1] + ' ' + self.autoncvar.set_var(aptype) + ' ' + str(aptype)
-
+        apfield = find_access_path_struct(val)
+        aptype = val['u'][apfield]
+        return str(val['type']).split('::')[1] + ' ' + \
+            self.autoncvar.set_var(aptype) + ' ' + str(aptype)
 AccessPathTraverser()
 
 #
@@ -741,12 +724,30 @@ class mem_root_dequePrinter(object):
     def to_string(self):
         return '%s' % self.typename
 
+class AccessPathPrinter(object):
+    """AccessPath has a big union, this printer make it pretty"""
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        s = '{'
+        for field in self.val.type.fields():
+            if field.name == 'u':
+                continue
+            if field.name is not None:
+                s += field.name + ' = '
+            s += str(self.val[field]) + ', '
+        apfield = find_access_path_struct(self.val)
+        s += 'u = {' + apfield.name + ' = ' + str(self.val['u'][apfield]) + '}}'
+        return s
+
 import gdb.printing
 def build_pretty_printer():
     pp = gdb.printing.RegexpCollectionPrettyPrinter(
         "mysqld")
     pp.add_printer('List', '^List<.*>$', ListPrinter)
     pp.add_printer('mem_root_deque', '^mem_root_deque<.*>$', mem_root_dequePrinter)
+    pp.add_printer('AccessPath', '^AccessPath$', AccessPathPrinter)
     return pp
 
 gdb.printing.register_pretty_printer(
