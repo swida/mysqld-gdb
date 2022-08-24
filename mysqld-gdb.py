@@ -9,10 +9,12 @@ mysql item -- explore expression (Item) tree
 mysql queryblock -- explore query block tree
 mysql seltree -- explore SEL_TREE struct
 mysql tablelist -- traverse TABLE_LIST list
+mysql accesspath -- explore AccessPath tree
 
 Pretty printers of structs:
 List
 mem_root_deque
+mem_root_array
 """
 from __future__ import print_function # python2.X support
 import re
@@ -624,6 +626,15 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
         accesspath = gdb.parse_and_eval(arg)
         self.walk(accesspath)
 
+    def get_materialize_children(self, val):
+        query_blocks = val['query_blocks']
+        size = int(query_blocks['m_size'])
+        array = query_blocks['m_array']
+        aps = []
+        for i in range(size):
+            aps.append(array[i]['subquery_path'])
+        return aps
+
     def walk_AccessPath(self, val):
         apfield = find_access_path_struct(val)
         aptype = val['u'][apfield]
@@ -631,13 +642,18 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
         for field in aptype.type.fields():
             if str(field.type) == 'AccessPath *':
                 child_aps.append(aptype[field])
+            if str(field.type) == 'MaterializePathParameters *':
+                child_aps += self.get_materialize_children(aptype[field])
         return child_aps
 
     def show_AccessPath(self, val):
         apfield = find_access_path_struct(val)
-        aptype = val['u'][apfield]
-        return str(val['type']).split('::')[1] + ' ' + \
-            self.autoncvar.set_var(aptype) + ' ' + str(aptype)
+        aptype = str(val['type']).split('::')[1]
+        aptyp_struct = val['u'][apfield]
+        struct_detail = '{ table = ' + aptyp_struct['table']['alias'].string() + ' }' \
+            if aptype == 'TABLE_SCAN' else str(aptyp_struct)
+        return aptype + ' ' + \
+            self.autoncvar.set_var(aptyp_struct) + ' ' + struct_detail
 AccessPathTraverser()
 
 #
@@ -664,7 +680,7 @@ class ListPrinter(object):
             self.nodetype = nodetype
             self.base = head
             self.end_of_list = gdb.parse_and_eval('end_of_list').address
-            self.autoncvar = autocvar.AutoNumCVar()
+            self.autoncvar = AutoNumCVar()
 
         def __iter__(self):
             return self
@@ -687,6 +703,39 @@ class ListPrinter(object):
 
     def to_string(self):
         return '%s' % self.typename if self.val['elements'] != 0 else 'empty %s' % self.typename
+
+class mem_root_arrayPrinter(object):
+    """Print List a mem_root_array"""
+
+    class _iterator(PrinterIterator):
+        def __init__(self, nodetype, array, size):
+            self.nodetype = nodetype
+            self.array = array
+            self.size = size
+            self.index = 0
+            self.autoncvar = AutoNumCVar()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index == self.size:
+                raise StopIteration
+            elt = self.array[self.index]
+            self.index += 1
+            val, cvname = expr_node_value(elt.cast(self.nodetype), self.autoncvar)
+            return (cvname, '(%s) %s' % (val.dynamic_type, val))
+
+    def __init__(self, val):
+        self.typename = val.type
+        self.val = val
+
+    def children(self):
+        nodetype = self.typename.template_argument(0)
+        return self._iterator(nodetype, self.val['m_array'], self.val['m_size'])
+
+    def to_string(self):
+        return '%s' % self.typename if self.val['m_size'] != 0 else 'empty %s' % self.typename
 
 # mem_root_deque is from 8.0.22+
 class mem_root_dequePrinter(object):
@@ -748,6 +797,7 @@ def build_pretty_printer():
     pp.add_printer('List', '^List<.*>$', ListPrinter)
     pp.add_printer('mem_root_deque', '^mem_root_deque<.*>$', mem_root_dequePrinter)
     pp.add_printer('AccessPath', '^AccessPath$', AccessPathPrinter)
+    pp.add_printer('mem_root_array', '^Mem_root_array_YY<.*>$', mem_root_arrayPrinter)
     return pp
 
 gdb.printing.register_pretty_printer(
