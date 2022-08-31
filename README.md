@@ -29,6 +29,11 @@ My development environment:
 - gdb version 12.1
 - MySQL server version 8.0.26
 
+Installation
+============
+Copy autocvar.py to the `PYTHON_PATH` directory e.g.`/usr/share/gdb/python` and
+copy `mysqld-gdb.py` to the directory same with mysqld executable file.
+
 Usage Examples
 ==============
 
