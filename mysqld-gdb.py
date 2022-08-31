@@ -737,6 +737,41 @@ class mem_root_arrayPrinter(object):
     def to_string(self):
         return '%s' % self.typename if self.val['m_size'] != 0 else 'empty %s' % self.typename
 
+class Bounds_checked_arrayPrinter(object):
+    """Print a Bounds_checked_array"""
+
+    class _iterator(PrinterIterator):
+        def __init__(self, nodetype, array, size):
+            self.nodetype = nodetype
+            self.array = array
+            self.size = size
+            self.index = 0
+            self.autoncvar = AutoNumCVar()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index == self.size:
+                raise StopIteration
+            elt = self.array[self.index]
+            if elt == 0:
+                raise StopIteration
+            self.index += 1
+            val, cvname = expr_node_value(elt.cast(self.nodetype), self.autoncvar)
+            return (cvname, '(%s) %s' % (val.dynamic_type, val))
+
+    def __init__(self, val):
+        self.typename = val.type
+        self.val = val
+
+    def children(self):
+        nodetype = self.typename.template_argument(0)
+        return self._iterator(nodetype, self.val['m_array'], self.val['m_size'])
+
+    def to_string(self):
+        return '%s' % self.typename if self.val['m_size'] != 0 else 'empty %s' % self.typename
+
 # mem_root_deque is from 8.0.22+
 class mem_root_dequePrinter(object):
     """Print a MySQL mem_root_deque List"""
@@ -771,7 +806,7 @@ class mem_root_dequePrinter(object):
         return self._iterator(nodetype, self.val)
 
     def to_string(self):
-        return '%s' % self.typename
+        return '%s' % self.typename if self.val['m_blocks'] != 0 else 'empty %s' % self.typename
 
 class AccessPathPrinter(object):
     """AccessPath has a big union, this printer make it pretty"""
@@ -798,6 +833,7 @@ def build_pretty_printer():
     pp.add_printer('mem_root_deque', '^mem_root_deque<.*>$', mem_root_dequePrinter)
     pp.add_printer('AccessPath', '^AccessPath$', AccessPathPrinter)
     pp.add_printer('mem_root_array', '^Mem_root_array_YY<.*>$', mem_root_arrayPrinter)
+    pp.add_printer('Bounds_checked_array', '^Bounds_checked_array<.*>$', Bounds_checked_arrayPrinter)
     return pp
 
 gdb.printing.register_pretty_printer(
