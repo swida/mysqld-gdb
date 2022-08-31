@@ -15,6 +15,7 @@ Pretty printers of structs:
 List
 mem_root_deque
 mem_root_array
+Bounds_checked_array
 """
 from __future__ import print_function # python2.X support
 import re
@@ -52,11 +53,15 @@ def mem_root_deque_to_list(deque):
 #
 # Some convenience variables for debug easily  because they are macros
 #
-autocvar.set_nvar('MAX_TABLES', gdb.parse_and_eval('sizeof(unsigned long long) * 8 - 3'))
-autocvar.set_nvar('INNER_TABLE_BIT', gdb.parse_and_eval('((unsigned long long)1) << ($MAX_TABLES + 0)'))
-autocvar.set_nvar('OUTER_REF_TABLE_BIT', gdb.parse_and_eval('((unsigned long long)1) << ($MAX_TABLES + 1)'))
-autocvar.set_nvar('RAND_TABLE_BIT', gdb.parse_and_eval('((unsigned long long)1) << ($MAX_TABLES + 2)'))
-autocvar.set_nvar('PSEUDO_TABLE_BITS', gdb.parse_and_eval('($INNER_TABLE_BIT | $OUTER_REF_TABLE_BIT | $RAND_TABLE_BIT)'))
+#
+# Some convenience variables for debug easily  because they are macros
+#
+if autocvar.gdb_can_set_cvar:
+    autocvar.set_nvar('MAX_TABLES', gdb.parse_and_eval('sizeof(unsigned long long) * 8 - 3'))
+    autocvar.set_nvar('INNER_TABLE_BIT', gdb.parse_and_eval('((unsigned long long)1) << ($MAX_TABLES + 0)'))
+    autocvar.set_nvar('OUTER_REF_TABLE_BIT', gdb.parse_and_eval('((unsigned long long)1) << ($MAX_TABLES + 1)'))
+    autocvar.set_nvar('RAND_TABLE_BIT', gdb.parse_and_eval('((unsigned long long)1) << ($MAX_TABLES + 2)'))
+    autocvar.set_nvar('PSEUDO_TABLE_BITS', gdb.parse_and_eval('($INNER_TABLE_BIT | $OUTER_REF_TABLE_BIT | $RAND_TABLE_BIT)'))
 
 # Define a mysql command prefix for all mysql related command
 gdb.Command('mysql', gdb.COMMAND_DATA, prefix=True)
@@ -252,7 +257,7 @@ class TreeWalker(object):
 
     def get_action_func(self, element_type, action_prefix):
         def type_name(typ):
-            return typ.name if typ.name != None and hasattr(typ, 'name') else str(typ)
+            return typ.name if hasattr(typ, 'name') and typ.name is not None else str(typ)
         func_name = action_prefix + type_name(element_type)
         if hasattr(self, func_name):
             return getattr(self, func_name)
@@ -606,7 +611,7 @@ def find_access_path_struct(access_path):
     u = access_path['u']
     aptype_field = None
     for field in u.type.fields():
-        if aptype_name.casefold() != field.name.casefold():
+        if aptype_name.lower() != field.name.lower():
             continue
         aptype_field = field
         break
@@ -637,11 +642,11 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
 
     def walk_AccessPath(self, val):
         apfield = find_access_path_struct(val)
-        aptype = val['u'][apfield]
+        aptype = val['u'][apfield.name]
         child_aps = []
         for field in aptype.type.fields():
             if str(field.type) == 'AccessPath *':
-                child_aps.append(aptype[field])
+                child_aps.append(aptype[field.name])
             if str(field.type) == 'MaterializePathParameters *':
                 child_aps += self.get_materialize_children(aptype[field])
         return child_aps
@@ -649,7 +654,7 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
     def show_AccessPath(self, val):
         apfield = find_access_path_struct(val)
         aptype = str(val['type']).split('::')[1]
-        aptyp_struct = val['u'][apfield]
+        aptyp_struct = val['u'][apfield.name]
         struct_detail = '{ table = ' + aptyp_struct['table']['alias'].string() + ' }' \
             if aptype == 'TABLE_SCAN' else str(aptyp_struct)
         return aptype + ' ' + \
@@ -820,9 +825,9 @@ class AccessPathPrinter(object):
                 continue
             if field.name is not None:
                 s += field.name + ' = '
-            s += str(self.val[field]) + ', '
+            s += str(self.val[field.name]) + ', '
         apfield = find_access_path_struct(self.val)
-        s += 'u = {' + apfield.name + ' = ' + str(self.val['u'][apfield]) + '}}'
+        s += 'u = {' + apfield.name + ' = ' + str(self.val['u'][apfield.name]) + '}}'
         return s
 
 import gdb.printing

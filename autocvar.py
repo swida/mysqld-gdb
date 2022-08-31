@@ -6,6 +6,8 @@ class AutoCVar(object):
     def __init__(self):
         self.cur_seq = ['a']
         self.gdb_can_set_cvar = hasattr(gdb, 'set_convenience_variable')
+        if not self.gdb_can_set_cvar:
+            print("Warning: your gdb is too old and does not support set_convenience_variable. You'd better upgrade it.")
 
     def get_name(self):
         cname = ''.join(self.cur_seq)
