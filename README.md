@@ -31,8 +31,16 @@ My development environment:
 
 Installation
 ============
-Copy autocvar.py to the `PYTHON_PATH` directory e.g.`/usr/share/gdb/python` and
-copy `mysqld-gdb.py` to the directory same with mysqld executable file.
+1. Copy autocvar.py to the `PYTHON_PATH` directory
+  e.g.`/usr/share/gdb/python`
+2. copy `mysqld-gdb.py` to the directory same with mysqld executable file.
+3. Add mysqld executable file path to gdb safe path dy adding this to
+  `~/.gdbinit` (replace `<mysqld executable file path>` with your real
+  path):
+
+```
+set auto-load safe-path <mysqld executable file path>
+```
 
 Usage Examples
 ==============
