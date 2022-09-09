@@ -53,9 +53,6 @@ def mem_root_deque_to_list(deque):
 #
 # Some convenience variables for debug easily  because they are macros
 #
-#
-# Some convenience variables for debug easily  because they are macros
-#
 if autocvar.gdb_can_set_cvar:
     autocvar.set_nvar('MAX_TABLES', gdb.parse_and_eval('sizeof(unsigned long long) * 8 - 3'))
     autocvar.set_nvar('INNER_TABLE_BIT', gdb.parse_and_eval('((unsigned long long)1) << ($MAX_TABLES + 0)'))
@@ -446,6 +443,29 @@ class TABLE_LIST_traverser(gdb.Command):
         print(traverse_TABLE_LIST(table_list, False))
 TABLE_LIST_traverser()
 
+class ORDER_traverser(gdb.Command):
+    """traverse ORDER list"""
+    def __init__(self):
+        super (ORDER_traverser, self).__init__("mysql order",
+                                               gdb.COMMAND_OBSCURE)
+    def invoke(self, arg, from_tty):
+        order = gdb.parse_and_eval(arg)
+        self.autoncvar = AutoNumCVar()
+        ord_typname = order.type.target() if order.type.code == gdb.TYPE_CODE_PTR else order.type.name
+        if ord_typname == "ORDER_with_src":
+            order = order['order']
+        while order:
+            v = order.dereference()
+            item = v['item']
+            direct = v['direction']
+            deitem = item.dereference()
+            print(self.autoncvar.set_var(v), '{item = ', item, ', *item = ',
+                  self.autoncvar.set_var(deitem), '(', deitem.dynamic_type, ') ',
+                  deitem, ', direction = ', direct, '}, ', sep='', end='')
+            order = v['next']
+        print('\b\b')
+ORDER_traverser()
+
 class SEL_TREE_traverser(gdb.Command, TreeWalker, ItemDisplayer):
     """explore SEL_TREE struct"""
     NO_MIN_RANGE = 1
@@ -760,8 +780,6 @@ class Bounds_checked_arrayPrinter(object):
             if self.index == self.size:
                 raise StopIteration
             elt = self.array[self.index]
-            if elt == 0:
-                raise StopIteration
             self.index += 1
             val, cvname = expr_node_value(elt.cast(self.nodetype), self.autoncvar)
             return (cvname, '(%s) %s' % (val.dynamic_type, val))
@@ -825,7 +843,7 @@ class AccessPathPrinter(object):
                 continue
             if field.name is not None:
                 s += field.name + ' = '
-            s += str(self.val[field.name]) + ', '
+                s += str(self.val[field.name]) + ', '
         apfield = find_access_path_struct(self.val)
         s += 'u = {' + apfield.name + ' = ' + str(self.val['u'][apfield.name]) + '}}'
         return s
