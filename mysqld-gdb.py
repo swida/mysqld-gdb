@@ -122,7 +122,11 @@ def brief_backtrace(filter_threads):
         frame_name = pretty_frame_name(frame_name)
         if frame_name:
             frames += frame_name + ','
-        frame = frame.older()
+        # Some gdb could raise a error if it is already the oldest frame
+        try:
+            frame = frame.older()
+        except gdb.MemoryError:
+            break
     frames = frames[:-1]
     return frames
 
@@ -136,14 +140,23 @@ class ThreadSearch(gdb.Command):
         pattern = re.compile(arg)
         threads = gdb_threads()
         old_thread = gdb.selected_thread()
+        thr_dict = {}
         for thr in threads:
+            if not thr.is_stopped():
+                continue
             thr.switch()
-            backtrace = gdb.execute('bt', False, True)
-            matched_frames = [fr for fr in backtrace.split('\n') if pattern.search(fr) is not None]
-            if matched_frames:
-                print(thr.num, brief_backtrace(None))
-
+            bframes = brief_backtrace(None)
+            if pattern.search(bframes) is None:
+                continue
+            if bframes in thr_dict:
+                thr_dict[bframes].append(thr.num)
+            else:
+                thr_dict[bframes] = [thr.num,]
         old_thread.switch()
+        thr_ow = [(v,k) for k,v in thr_dict.items()]
+        thr_ow.sort(key = lambda l:len(l[0]), reverse=True)
+        for nums_thr,funcs in thr_ow:
+           gdb.write("[%s] %s\n" % (','.join([str(i) for i in nums_thr]), funcs))
 ThreadSearch()
 
 class ThreadOverview(gdb.Command):
@@ -181,6 +194,8 @@ class ThreadOverview(gdb.Command):
         old_thread = gdb.selected_thread()
         thr_dict = {}
         for thr in threads:
+            if not thr.is_stopped():
+                continue
             thr.switch()
             bframes = brief_backtrace(self.filter_threads)
             if bframes is None:
@@ -189,11 +204,11 @@ class ThreadOverview(gdb.Command):
                 thr_dict[bframes].append(thr.num)
             else:
                 thr_dict[bframes] = [thr.num,]
+        old_thread.switch()
         thr_ow = [(v,k) for k,v in thr_dict.items()]
         thr_ow.sort(key = lambda l:len(l[0]), reverse=True)
         for nums_thr,funcs in thr_ow:
-           print(','.join([str(i) for i in nums_thr]), funcs)
-        old_thread.switch()
+           gdb.write("[%s] %s\n" % (','.join([str(i) for i in nums_thr]), funcs))
 ThreadOverview()
 
 class TreeWalker(object):
@@ -766,10 +781,11 @@ class Bounds_checked_arrayPrinter(object):
     """Print a Bounds_checked_array"""
 
     class _iterator(PrinterIterator):
-        def __init__(self, nodetype, array, size):
+        def __init__(self, nodetype, array, size, ref_item_array):
             self.nodetype = nodetype
             self.array = array
             self.size = size
+            self.ref_item_array = ref_item_array
             self.index = 0
             self.autoncvar = AutoNumCVar()
 
@@ -780,9 +796,14 @@ class Bounds_checked_arrayPrinter(object):
             if self.index == self.size:
                 raise StopIteration
             elt = self.array[self.index]
+            if self.ref_item_array and elt == 0:
+                raise StopIteration
             self.index += 1
             val, cvname = expr_node_value(elt.cast(self.nodetype), self.autoncvar)
-            return (cvname, '(%s) %s' % (val.dynamic_type, val))
+            if self.ref_item_array:
+                return (cvname, '%s: (%s) %s' % (elt.address, val.dynamic_type, val))
+            else:
+                return (cvname, '(%s) %s' % (val.dynamic_type, val))
 
     def __init__(self, val):
         self.typename = val.type
@@ -790,7 +811,7 @@ class Bounds_checked_arrayPrinter(object):
 
     def children(self):
         nodetype = self.typename.template_argument(0)
-        return self._iterator(nodetype, self.val['m_array'], self.val['m_size'])
+        return self._iterator(nodetype, self.val['m_array'], self.val['m_size'], self.typename.name == 'Ref_item_array')
 
     def to_string(self):
         return '%s' % self.typename if self.val['m_size'] != 0 else 'empty %s' % self.typename
