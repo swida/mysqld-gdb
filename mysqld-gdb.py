@@ -825,9 +825,25 @@ class mem_root_dequePrinter(object):
             self.nodetype = nodetype
             self.base = head['m_begin_idx']
             self.end = head['m_end_idx']
-            self.elements = head['block_elements']
+            self.block_elements = head['block_elements']
+            try:
+                x = self.base / self.block_elements
+            except gdb.error:
+                self.block_elements = self.get_block_elements()
             self.blocks = head['m_blocks']
             self.autoncvar = AutoNumCVar()
+
+        def get_block_elements(self):
+            """Some gdb version e.g. gdb 9.2 in devtools-10, static
+            constexpr block_elements is optimized out, This function
+            calculates block_elements dynamically see,
+            FindElementsPerBlock() in mem_root_deque.h
+            """
+            base_number_elems = 1024 / self.nodetype.sizeof
+            for block_size in range(16, 1024):
+                if block_size >= base_number_elems:
+                    return block_size;
+                return 1024
 
         def __iter__(self):
             return self
@@ -835,8 +851,7 @@ class mem_root_dequePrinter(object):
         def __next__(self):
             if self.base == self.end:
                 raise StopIteration
-            #elt = self.base.dereference()
-            elt = self.blocks[self.base / self.elements]['elements'][self.base % self.elements]
+            elt = self.blocks[self.base / self.block_elements]['elements'][self.base % self.block_elements]
             self.base = self.base + 1
             val, cvname = expr_node_value(elt.cast(self.nodetype), self.autoncvar)
             return (cvname, '(%s) %s' % (elt.dynamic_type, val))
