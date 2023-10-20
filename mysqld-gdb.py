@@ -1,6 +1,8 @@
 """A gdb module for mysql-server development which includes some mysql
 commands and some pretty printers.
 
+Please visit https://github.com/swida/mysqld-gdb for latest sources.
+
 Commands:
 thread overview -- display thread brief with backtrace aggregation
 thread search -- find a thread given a keyword of backtrace function name
