@@ -85,6 +85,29 @@ class DigestPrinter(gdb.Command):
         print()
 DigestPrinter()
 
+class CurrentRunningSQL(gdb.Command):
+    """Print current thread running sql statement"""
+    def __init__(self):
+        super (CurrentRunningSQL, self).__init__ ("mysql sqlstring", gdb.COMMAND_OBSCURE)
+
+    def print_thd_query_string(self, thd):
+        sqlstr = thd['m_query_string']['str']
+        print(sqlstr.string()) if sqlstr else print("No sql is running")
+
+    def invoke(self, arg, from_tty):
+        sym_thd = gdb.lookup_symbol("current_thd")
+        if sym_thd[0] is not None:
+            current_thd = gdb.parse_and_eval("current_thd")
+            self.print_thd_query_string(current_thd)
+            return
+        sym_thd = gdb.lookup_symbol("get_current_thd")
+        if sym_thd[0] is not None:
+            current_thd = gdb.parse_and_eval("get_current_thd()")
+            self.print_thd_query_string(current_thd)
+        else:
+            print("Unknown current thread descriptor.")
+CurrentRunningSQL()
+
 #
 # threads overview/search for mysql
 #
