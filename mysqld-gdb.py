@@ -7,8 +7,10 @@ Commands:
 thread overview -- display thread brief with backtrace aggregation
 thread search -- find a thread given a keyword of backtrace function name
 mysql digest -- decode a statement digest to readable string
+mysql sqlstring -- print running sql statement in current thread
 mysql item -- explore expression (Item) tree
 mysql queryblock -- explore query block tree
+mysql dump_tables -- dump all current query used tables
 mysql seltree -- explore SEL_TREE struct
 mysql tablelist -- traverse TABLE_LIST list
 mysql accesspath -- explore AccessPath tree
@@ -51,6 +53,11 @@ def mem_root_deque_to_list(deque):
         p += 1
 
     return out_list
+
+def is_pointer_of(field, typname):
+    """check field is a pointer of typname"""
+    return field.type.code == gdb.TYPE_CODE_PTR and \
+        field.type.target().name == typname
 
 #
 # Some convenience variables for debug easily  because they are macros
@@ -239,6 +246,9 @@ ThreadOverview()
 class TreeWalker(object):
     """A base class for tree traverse"""
 
+    SHOW_FUNC_PREFIX = 'show_'
+    WALK_FUNC_PREFIX = 'walk_'
+
     def __init__(self):
         self.level_graph = []
         self.autoncvar = None
@@ -255,14 +265,6 @@ class TreeWalker(object):
     def do_walk(self, expr, level):
         expr_typed = expr.dynamic_type
         expr_casted = expr.cast(expr_typed)
-        expr_nodetype = None
-        try:
-            expr_nodetype = expr.type.template_argument(0)
-            if expr_nodetype.code != gdb.TYPE_CODE_PTR:
-                expr_nodetype = expr.type.template_argument(0).pointer()
-        except (gdb.error, RuntimeError):
-            expr_nodetype = None
-            pass
         self.current_level = level
         level_graph = '  '.join(self.level_graph[:level])
         for i, c in enumerate(self.level_graph):
@@ -271,13 +273,13 @@ class TreeWalker(object):
         cname = self.autoncvar.set_var(expr_casted)
         left_margin = "{}{}".format('' if level == 0 else '--', cname)
         element_show_info = ''
-        show_func = self.get_show_func(expr_typed, expr_nodetype)
+        show_func = self.get_action_func(expr_typed, self.SHOW_FUNC_PREFIX)
         if show_func is not None:
             element_show_info = show_func(expr_casted)
         if element_show_info is not None:
             print("{}{} ({}) {} {}".format(
                   level_graph, left_margin, expr_typed, expr, element_show_info))
-        walk_func = self.get_walk_func(expr_typed, expr_nodetype)
+        walk_func = self.get_action_func(expr_typed, self.WALK_FUNC_PREFIX)
         if walk_func is None:
             return
         children = walk_func(expr_casted)
@@ -293,10 +295,12 @@ class TreeWalker(object):
             self.do_walk(child, level + 1)
 
     def get_action_func(self, element_type, action_prefix):
+        if element_type.code == gdb.TYPE_CODE_PTR:
+            element_type = element_type.target()
         def type_name(typ):
             return typ.name if hasattr(typ, 'name') and typ.name is not None else str(typ)
         func_name = action_prefix + type_name(element_type)
-        if hasattr(self, func_name):
+        if hasattr(self, func_name) and callable(getattr(self, func_name)):
             return getattr(self, func_name)
 
         for field in element_type.fields():
@@ -304,24 +308,16 @@ class TreeWalker(object):
                 continue
             typ = field.type
             func_name = action_prefix + type_name(typ)
-
             if hasattr(self, func_name):
                 return getattr(self, func_name)
 
             return self.get_action_func(typ, action_prefix)
+
+        # Fall through to common action function
+        if hasattr(self, action_prefix) and callable(getattr(self, action_prefix)):
+            return getattr(self, action_prefix)
+
         return None
-
-    def get_walk_func(self, element_type, element_type_templ):
-        if element_type_templ != None:
-            return self.get_action_func(element_type_templ.target(), 'walk_templ_')
-        else:
-            return self.get_action_func(element_type.target(), 'walk_')
-
-    def get_show_func(self, element_type, element_type_templ):
-        if element_type_templ != None:
-            return self.get_action_func(element_type_templ.target(), 'show_templ_')
-        else:
-            return self.get_action_func(element_type.target(), 'show_')
 
 class ItemDisplayer(object):
     """mysql item basic show functions"""
@@ -367,6 +363,19 @@ class ItemExpressionTraverser(gdb.Command, TreeWalker, ItemDisplayer):
     #
     # walk and show functions for each Item class
     #
+    def list_items(self, item_list):
+        end_of_list = gdb.parse_and_eval('end_of_list').address
+        nodetype = item_list.type.template_argument(0)
+        cur_elt = item_list['first']
+        children = []
+        while cur_elt != end_of_list:
+            info = cur_elt.dereference()['info']
+            children.append(info.cast(nodetype.pointer()))
+            cur_elt = cur_elt.dereference()['next']
+        return children
+
+    def walk_Item_equal(self, val):
+        return self.list_items(val['fields'])
 
     def walk_Item_func(self, val):
         children = []
@@ -377,16 +386,7 @@ class ItemExpressionTraverser(gdb.Command, TreeWalker, ItemDisplayer):
     walk_Item_sum = walk_Item_func
 
     def walk_Item_cond(self, val):
-        end_of_list = gdb.parse_and_eval('end_of_list').address
-        item_list = val['list']
-        nodetype = item_list.type.template_argument(0)
-        cur_elt = item_list['first']
-        children = []
-        while cur_elt != end_of_list:
-            info = cur_elt.dereference()['info']
-            children.append(info.cast(nodetype.pointer()))
-            cur_elt = cur_elt.dereference()['next']
-        return children
+        return self.list_items(val['list'])
 ItemExpressionTraverser()
 
 def print_TABLE_LIST(lt, autoncvar):
@@ -464,14 +464,63 @@ class QueryBlockTraverser(gdb.Command, TreeWalker):
         return self.get_current_marker(val)
 
     def show_Query_block(self, val):
+        select_number = val['select_number']
         leaf_tables = val['leaf_tables']
         table_list = traverse_TABLE_LIST(leaf_tables, True)
-        return table_list + self.get_current_marker(val)
+        return "#%d, " % select_number + table_list + self.get_current_marker(val)
 
     # Support version before 8.0.24
     show_SELECT_LEX = show_Query_block
     show_SELECT_LEX_UNIT = show_Query_expression
 QueryBlockTraverser()
+
+class DumpAllLeafTables(gdb.Command):
+    """Dump current used tables with format of each line: db table1 table2 ..."""
+    def __init__(self):
+        super(DumpAllLeafTables, self).__init__("mysql dump_tables",
+                                            gdb.COMMAND_OBSCURE)
+        self.tables = {}
+
+    def add_table(self, db_name, table_name):
+        try:
+            if table_name not in self.tables[db_name]:
+                self.tables[db_name].append(table_name)
+        except KeyError:
+            self.tables[db_name] = [table_name,]
+
+    def get_leaf_tables(self, table_list):
+        TABLE_CATEGORY_USER = 2
+        while table_list != 0:
+            table_share = table_list['table']['s']
+            db_name = table_share['db']['str'].string()
+            table_name = table_share['table_name']['str'].string()
+            if table_share['table_category'] == TABLE_CATEGORY_USER:
+                self.add_table(db_name, table_name)
+
+            table_list = table_list['next_leaf']
+
+    def walk(self, query_expression):
+        # top_most must be Query_expression, its slave is a Query_block
+        query_block = query_expression['slave']
+        while query_block != 0:
+            self.get_leaf_tables(query_block['leaf_tables'])
+            inner_expression = query_block['slave']
+            while inner_expression != 0:
+                self.walk(inner_expression)
+                inner_expression = inner_expression['next']
+            query_block = query_block['next']
+
+    def invoke(self, arg, from_tty):
+        if not arg:
+            print("usage: mysql dump_tables [Query_expression/Query_block]")
+            return
+        qb = gdb.parse_and_eval(arg)
+        while qb.dereference()['master']:
+            qb = qb.dereference()['master']
+        self.walk(qb)
+        for db, tables in self.tables.items():
+            print (db, ' '.join(tables))
+DumpAllLeafTables()
 
 class TABLE_LIST_traverser(gdb.Command):
     """traverse TABLE_LIST list"""
@@ -705,9 +754,9 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
         aptype = val['u'][apfield.name]
         child_aps = []
         for field in aptype.type.fields():
-            if str(field.type) == 'AccessPath *':
+            if is_pointer_of(field, 'AccessPath') and aptype[field.name] != 0:
                 child_aps.append(aptype[field.name])
-            if str(field.type) == 'MaterializePathParameters *':
+            if is_pointer_of(field, 'MaterializePathParameters'):
                 child_aps += self.get_materialize_children(aptype[field])
         return child_aps
 
