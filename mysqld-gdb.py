@@ -422,6 +422,17 @@ def traverse_TABLE_LIST(table_list, only_leaf):
         s += 'global tables: ' + global_tables
     return s
 
+# Traverse Query expression / Query block tree, output like this:
+# $nv0 (Query_expression *) 0x7ffff1e81858
+# `--$nv1 (Query_block *) 0x7ffff1e81fc8 #1, leaf tables: ($nw0)t2 <-
+#    `--$nv2 (Query_expression *) 0x7ffff1f5c0b0 s                                 1.
+#       `--$nv3 (Query_block *) 0x7ffff1f5c820 #2, leaf tables: ($nx0)t3, ($nx1) t4
+#          `--$nv4 (Query_expression *) 0x7ffff24f86e8 
+#             `--$nv5 (Query_block *) 0x7ffff24f8e58 #3, leaf tables: ($ny0)t3
+#             `--$nv5 (Query_block *) 0x7ffff24f9e58 #4d, leaf tables: ($nz0)t4    2.
+# Here:
+#  1. 's' means Item_singlerow_subselect, other position markers see get_subselect_marker()
+#  2. '4d' 'd' means union_distinct
 class QueryBlockTraverser(gdb.Command, TreeWalker):
     """explore query block tree"""
     def __init__ (self):
@@ -461,13 +472,29 @@ class QueryBlockTraverser(gdb.Command, TreeWalker):
         return ' <-'
 
     def show_Query_expression(self, val):
-        return self.get_current_marker(val)
+        marker = self.get_subselect_marker(val['item'])
+        if marker:
+            marker += ' '
+        return marker + self.get_current_marker(val)
+
+    def get_subselect_marker(self, subs):
+        if not subs:
+            return ''
+        subs_class_name = subs.dynamic_type.target().name
+        # 's' -> Item_singlerow_subselect
+        # 'm' -> Item_maxmin_subselect
+        # 'e' -> Item_exists_subselect
+        # 'i' -> Item_in_subselect
+        # 'a' -> Item_allany_subselect
+        return subs_class_name[5]
 
     def show_Query_block(self, val):
         select_number = val['select_number']
         leaf_tables = val['leaf_tables']
         table_list = traverse_TABLE_LIST(leaf_tables, True)
-        return "#%d, " % select_number + table_list + self.get_current_marker(val)
+        marker = 'd' if val['master']['union_distinct'] is not None and \
+            val['master']['union_distinct'] == val else ''
+        return "#%d%s, " % (select_number, marker) + table_list + self.get_current_marker(val)
 
     # Support version before 8.0.24
     show_SELECT_LEX = show_Query_block
@@ -740,13 +767,12 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
         accesspath = gdb.parse_and_eval(arg)
         self.walk(accesspath)
 
-    def get_materialize_children(self, val):
-        query_blocks = val['query_blocks']
-        size = int(query_blocks['m_size'])
-        array = query_blocks['m_array']
+    def get_children_from_array(self, array, array_item_field):
+        size = int(array['m_size'])
+        raw_array = array['m_array']
         aps = []
         for i in range(size):
-            aps.append(array[i]['subquery_path'])
+            aps.append(raw_array[i][array_item_field])
         return aps
 
     def walk_AccessPath(self, val):
@@ -756,8 +782,11 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
         for field in aptype.type.fields():
             if is_pointer_of(field, 'AccessPath') and aptype[field.name] != 0:
                 child_aps.append(aptype[field.name])
-            if is_pointer_of(field, 'MaterializePathParameters'):
-                child_aps += self.get_materialize_children(aptype[field])
+            elif is_pointer_of(field, 'MaterializePathParameters'):
+                child_aps += self.get_children_from_array(aptype[field]['query_blocks'], 'subquery_path')
+            elif field.name == 'children':
+                child_aps += self.get_children_from_array(aptype[field], 'path')
+
         return child_aps
 
     def show_AccessPath(self, val):
@@ -957,6 +986,25 @@ class AccessPathPrinter(object):
         apfield = find_access_path_struct(self.val)
         s += 'u = {' + apfield.name + ' = ' + str(self.val['u'][apfield.name]) + '}}'
         return s
+class Func_ptrPrinter(object):
+    """Print actual Item type in Func_ptr"""
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        copy_from = self.val['m_func']
+        copy_to = self.val['m_result_field']
+        bits = self.val['m_func_bits']
+        bits_str = ''
+        cft = gdb.lookup_type('Copy_func_type')
+        for bit in cft.fields():
+            mask = 1 << bit.enumval
+            if mask & bits:
+                bits_str += bit.name + ' | '
+        bits_str = bits_str[:-3]
+
+        return '(%s) %s -> (%s) %s with %s' % (
+            copy_from.dynamic_type, copy_from, copy_to.dynamic_type, copy_to, bits_str)
 
 import gdb.printing
 def build_pretty_printer():
@@ -965,8 +1013,9 @@ def build_pretty_printer():
     pp.add_printer('List', '^List<.*>$', ListPrinter)
     pp.add_printer('mem_root_deque', '^mem_root_deque<.*>$', mem_root_dequePrinter)
     pp.add_printer('AccessPath', '^AccessPath$', AccessPathPrinter)
-    pp.add_printer('mem_root_array', '^Mem_root_array_YY<.*>$', mem_root_arrayPrinter)
+    pp.add_printer('Mem_root_array', '^Mem_root_array<.*>$', mem_root_arrayPrinter)
     pp.add_printer('Bounds_checked_array', '^Bounds_checked_array<.*>$', Bounds_checked_arrayPrinter)
+    pp.add_printer('Func_ptr', '^Func_ptr$', Func_ptrPrinter)
     return pp
 
 gdb.printing.register_pretty_printer(
