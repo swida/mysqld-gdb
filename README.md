@@ -18,8 +18,10 @@ Pretty printers
 
 - List
 - mem_root_deque
-- mem_root_array
+- AccessPath
+- Mem_root_array
 - Bounds_checked_array (e.g. base_ref_items)
+- Func_ptr
 
 Requirement
 ===========

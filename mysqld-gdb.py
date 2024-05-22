@@ -94,6 +94,19 @@ class DigestPrinter(gdb.Command):
         print()
 DigestPrinter()
 
+# frame iterators
+def foreach_frame(func):
+    frame = gdb.newest_frame() if hasattr(gdb, 'newest_frame') else gdb.selected_frame()
+    while frame is not None:
+        res = func(frame)
+        if res is not None:
+            return res
+        # Some gdb could raise a error if it is already the oldest frame
+        try:
+            frame = frame.older()
+        except gdb.MemoryError:
+            return None
+
 class CurrentRunningSQL(gdb.Command):
     """Print current thread running sql statement"""
     def __init__(self):
@@ -103,18 +116,30 @@ class CurrentRunningSQL(gdb.Command):
         sqlstr = thd['m_query_string']['str']
         print(sqlstr.string()) if sqlstr else print("No sql is running")
 
+    def find_local_thd(self, frame):
+        try:
+            var = frame.read_var('thd')
+            return var
+        except (gdb.error, ValueError):
+            pass
+
+    def error(self):
+        print("Can not find current thread descriptor.")
+
     def invoke(self, arg, from_tty):
+        # Try to find thread local variable current_thd
         sym_thd = gdb.lookup_symbol("current_thd")
         if sym_thd[0] is not None:
-            current_thd = gdb.parse_and_eval("current_thd")
-            self.print_thd_query_string(current_thd)
+            self.print_thd_query_string(sym_thd[0].value())
             return
-        sym_thd = gdb.lookup_symbol("get_current_thd")
-        if sym_thd[0] is not None:
-            current_thd = gdb.parse_and_eval("get_current_thd()")
-            self.print_thd_query_string(current_thd)
-        else:
-            print("Unknown current thread descriptor.")
+        # if there is no current_thd, Must be reading core, try to find thd
+        # local variables in parent stacks
+        thd = foreach_frame(self.find_local_thd)
+        if thd is None:
+            self.error()
+            return
+        self.print_thd_query_string(thd)
+
 CurrentRunningSQL()
 
 #
@@ -387,6 +412,9 @@ class ItemExpressionTraverser(gdb.Command, TreeWalker, ItemDisplayer):
 
     def walk_Item_cond(self, val):
         return self.list_items(val['list'])
+
+    def walk_Item_cache(self, val):
+        return [val['example'],]
 ItemExpressionTraverser()
 
 def print_TABLE_LIST(lt, autoncvar):
