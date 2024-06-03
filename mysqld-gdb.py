@@ -99,29 +99,30 @@ def foreach_frame(func):
     frame = gdb.newest_frame() if hasattr(gdb, 'newest_frame') else gdb.selected_frame()
     while frame is not None:
         res = func(frame)
-        if res is not None:
-            return res
+        if res:
+            break
         # Some gdb could raise a error if it is already the oldest frame
         try:
             frame = frame.older()
         except gdb.MemoryError:
-            return None
+            return
 
 class CurrentRunningSQL(gdb.Command):
     """Print current thread running sql statement"""
     def __init__(self):
         super (CurrentRunningSQL, self).__init__ ("mysql sqlstring", gdb.COMMAND_OBSCURE)
 
-    def print_thd_query_string(self, thd):
-        sqlstr = thd['m_query_string']['str']
-        print(sqlstr.string()) if sqlstr else print("No sql is running")
-
-    def find_local_thd(self, frame):
+    def print_query_from_local_thd(self, frame):
         try:
-            var = frame.read_var('thd')
-            return var
-        except (gdb.error, ValueError):
+            thd = frame.read_var('thd')
+            sqlstr = thd['m_query_string']['str']
+            if sqlstr:
+                print(sqlstr.string())
+                return True
+        except (gdb.error, gdb.MemoryError, ValueError):
             pass
+
+        return False
 
     def error(self):
         print("Can not find current thread descriptor.")
@@ -130,15 +131,13 @@ class CurrentRunningSQL(gdb.Command):
         # Try to find thread local variable current_thd
         sym_thd = gdb.lookup_symbol("current_thd")
         if sym_thd[0] is not None:
-            self.print_thd_query_string(sym_thd[0].value())
+            thd = sym_thd[0].value()
+            sqlstr = thd['m_query_string']['str']
+            print(sqlstr.string()) if sqlstr else print("No sql is running")
             return
         # if there is no current_thd, Must be reading core, try to find thd
         # local variables in parent stacks
-        thd = foreach_frame(self.find_local_thd)
-        if thd is None:
-            self.error()
-            return
-        self.print_thd_query_string(thd)
+        foreach_frame(self.print_query_from_local_thd)
 
 CurrentRunningSQL()
 
