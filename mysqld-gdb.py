@@ -889,6 +889,59 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
             self.autoncvar.set_var(aptyp_struct) + ' ' + struct_detail
 AccessPathTraverser()
 
+class OptPathTraverser(gdb.Command, TreeWalker):
+    """explore access path tree"""
+    def __init__ (self):
+        super(self.__class__, self).__init__ ("mysql optpath", gdb.COMMAND_OBSCURE)
+
+    def invoke(self, arg, from_tty):
+        if not arg:
+            print("usage: mysql optpath [path] [context]")
+            return
+        args = arg.split()
+        path = gdb.parse_and_eval(args[0])
+        self.context = gdb.parse_and_eval(args[1])
+        self.walk(path)
+
+    def walk_pq_opt_Path(self, val):
+        subpaths = []
+        subpath1 = val['subpath1']
+        if subpath1:
+            subpaths.append(subpath1)
+        else:
+            return subpaths
+        subpath2 = val['subpath2']
+        if subpath2:
+            subpaths.append(subpath2)
+        return subpaths
+
+    def distinfo_to_str(self, distinfo):
+        disttype = str(distinfo['type'])
+        return disttype.split('::')[-1]
+
+    def get_access_path(self, apindex):
+        deque = self.context['m_access_path_state']
+        blocks = deque['m_blocks']
+        base = deque['m_begin_idx']
+        end = deque['m_end_idx']
+        block_elements = deque['block_elements']
+        return blocks[(base + apindex) / block_elements]['elements'][(base + apindex) % block_elements]
+
+    def show_pq_opt_Path(self, val):
+        distinfo = val['distinfo']
+        self.distinfo_to_str(distinfo)
+        apindex = int(val['access_path_state'])
+        access_type = str(apindex)
+        properties = str(val['properties'])
+        properties = properties.replace('pq::opt::','')
+        #access_path =
+        #self.context['m_access_path_state']['m_array'][apindex]['access_path']
+        access_path = self.get_access_path(apindex)['access_path']
+        access_type = str(access_path['type']).split('::')[-1]
+        access_type += table_name_from_access_path(access_path)
+        return access_type + ': ' + self.distinfo_to_str(distinfo) + ', ' + str(properties)
+OptPathTraverser()
+
 #
 # pretty printers
 #
