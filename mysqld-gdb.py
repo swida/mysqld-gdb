@@ -23,7 +23,56 @@ Bounds_checked_array
 """
 from __future__ import print_function # python2.X support
 import re
-from autocvar import autocvar, AutoNumCVar
+import gdb
+#
+# A class to generate an unique gdb convenience variable name
+#
+class AutoCVar(object):
+    maxlen = 2
+    gdb_can_set_cvar = True
+    def __init__(self):
+        self.cur_seq = ['a']
+        self.gdb_can_set_cvar = hasattr(gdb, 'set_convenience_variable')
+        if not self.gdb_can_set_cvar:
+            print("Warning: your gdb is too old and does not support set_convenience_variable. You'd better upgrade it.")
+
+    def get_name(self):
+        cname = ''.join(self.cur_seq)
+        clen = len(self.cur_seq)
+        for i, c in reversed(list(enumerate(self.cur_seq))):
+            if c == 'z':
+                continue
+            self.cur_seq[i] = chr(ord(c) + 1)
+            for j in range(i + 1, clen):
+                self.cur_seq[j] = 'a'
+            break
+        else:
+            self.cur_seq = ['a'] * \
+                (1 if clen == self.maxlen else (clen + 1))
+
+        return cname
+
+    def set_nvar(self, varname, var):
+        if not self.gdb_can_set_cvar:
+            return ''
+        gdb.set_convenience_variable(varname, var)
+        return '$' + varname
+
+    def set_var(self, var):
+        return self.set_nvar(self.get_name(), var)
+
+autocvar = AutoCVar()
+
+class AutoNumCVar(object):
+    def __init__(self, init_num = 0):
+        self.cvar_name = autocvar.get_name()
+        self.cur_num = init_num
+
+    def set_var(self, var):
+        cvname = self.cvar_name + str(self.cur_num)
+        self.cur_num += 1
+        return autocvar.set_nvar(cvname, var)
+
 #
 # Some utility functions
 #
@@ -322,7 +371,8 @@ class TreeWalker(object):
         if element_type.code == gdb.TYPE_CODE_PTR:
             element_type = element_type.target()
         def type_name(typ):
-            return typ.name if hasattr(typ, 'name') and typ.name is not None else str(typ)
+            typ_name = typ.name if hasattr(typ, 'name') and typ.name is not None else str(typ)
+            return typ_name.replace('::', '_')
         func_name = action_prefix + type_name(element_type)
         if hasattr(self, func_name) and callable(getattr(self, func_name)):
             return getattr(self, func_name)
@@ -782,6 +832,20 @@ def find_access_path_struct(access_path):
         raise "No access path struct found for type: %s" % aptype_name
     return aptype_field
 
+def table_name_from_access_path(val):
+    apfield = find_access_path_struct(val)
+    aptyp_struct = val['u'][apfield.name]
+    has_table = False;
+    for field in aptyp_struct.type.fields():
+        if field.name.lower() == 'table':
+            has_table = True
+            break
+    if not has_table or not aptyp_struct['table']:
+        return ''
+    name = aptyp_struct['table']['s']['table_name']['str'].string()
+    alias = aptyp_struct['table']['alias'].string()
+    return f'<{name} {alias}>' if name.find('/') == -1 else f'<{alias}>'
+
 class AccessPathTraverser(gdb.Command, TreeWalker):
     """explore access path tree"""
     def __init__ (self):
@@ -820,9 +884,8 @@ class AccessPathTraverser(gdb.Command, TreeWalker):
         apfield = find_access_path_struct(val)
         aptype = str(val['type']).split('::')[1]
         aptyp_struct = val['u'][apfield.name]
-        struct_detail = '{ table = ' + aptyp_struct['table']['alias'].string() + ' }' \
-            if aptype == 'TABLE_SCAN' else str(aptyp_struct)
-        return aptype + ' ' + \
+        struct_detail = str(aptyp_struct)
+        return aptype + table_name_from_access_path(val) + ': ' + \
             self.autoncvar.set_var(aptyp_struct) + ' ' + struct_detail
 AccessPathTraverser()
 
