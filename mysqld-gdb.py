@@ -942,6 +942,35 @@ class OptPathTraverser(gdb.Command, TreeWalker):
         return access_type + ': ' + self.distinfo_to_str(distinfo) + ', ' + str(properties)
 OptPathTraverser()
 
+class MDL_traverser(gdb.Command):
+    """print metadata locks"""
+    def __init__ (self):
+        super (MDL_traverser, self).__init__("mysql mdl", gdb.COMMAND_OBSCURE)
+
+    def _print_mdl_list(self, args):
+        mdl = args.dereference()
+        while str(mdl.address) != '0x0':
+            mdl_dict = {}
+            mdl_dict['mdl_type'] = str(mdl['m_type'])
+            mdl_dict['mdl_key_mptr'] = str(mdl['m_lock']['key']['m_ptr'])
+            mdl_dict['mdl_key_type'] = str(mdl['m_lock']['key']['m_ptr'][0].cast(gdb.lookup_type("MDL_key::enum_mdl_namespace")))
+            print(str(mdl_dict))
+            mdl = mdl['next_in_context'].dereference()
+
+    def invoke(self, args, from_tty):
+        if not args:
+            print("usage: mysql mdl [THD]")
+        thd_val = gdb.parse_and_eval(args).dereference()
+        if str(thd_val.type).startswith("THD"):
+            print("m_durations[0]")
+            self._print_mdl_list(thd_val['mdl_context']['m_ticket_store']['m_durations'][0]['m_ticket_list']['m_first'])
+            print("m_durations[1]")
+            self._print_mdl_list(thd_val['mdl_context']['m_ticket_store']['m_durations'][1]['m_ticket_list']['m_first'])
+            print("m_durations[2]")
+        else:
+            print("usage: mysql mdl [THD]")
+MDL_traverser()
+
 #
 # pretty printers
 #
