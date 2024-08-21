@@ -844,7 +844,7 @@ def table_name_from_access_path(val):
         return ''
     name = aptyp_struct['table']['s']['table_name']['str'].string()
     alias = aptyp_struct['table']['alias'].string()
-    return f'<{name} {alias}>' if name.find('/') == -1 else f'<{alias}>'
+    return '<{} {}>'.format(name, alias) if name.find('/') == -1 else '<{}>'.format(alias)
 
 class AccessPathTraverser(gdb.Command, TreeWalker):
     """explore access path tree"""
