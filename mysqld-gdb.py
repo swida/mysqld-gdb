@@ -118,11 +118,46 @@ if autocvar.gdb_can_set_cvar:
     autocvar.set_nvar('RAND_TABLE_BIT', gdb.parse_and_eval('((unsigned long long)1) << ($MAX_TABLES + 2)'))
     autocvar.set_nvar('PSEUDO_TABLE_BITS', gdb.parse_and_eval('($INNER_TABLE_BIT | $OUTER_REF_TABLE_BIT | $RAND_TABLE_BIT)'))
 
+
+class ConvenienceVarPrint(gdb.Command):
+    """Print convenience variables"""
+    def __init__(self):
+        super(__class__, self).__init__("cv", gdb.COMMAND_OBSCURE)
+    def invoke(self, arg, from_tty):
+        cvar_str = arg
+        fields = []
+        if '.' in cvar_str:
+            strs = cvar_str.split('.')
+            cvar_str = strs[0]
+            fields = strs[1:]
+        for v in self.get_all_convenience_vars(cvar_str):
+            self.print_cvar(v, fields)
+
+    def print_cvar(self, cv_name, fields):
+        val = gdb.convenience_variable(cv_name)
+        for field in fields:
+            val = val[field]
+        if val.type.code == gdb.TYPE_CODE_PTR:
+            val = val.dereference()
+        prname = '$' + cv_name
+        if fields:
+            prname += '.' + '.'.join(fields)
+        print(prname, '=', val)
+
+    def get_all_convenience_vars(self, cvar_str):
+        mvar = re.compile(r"\$" + cvar_str + r"\d+")
+        vars = filter(lambda s: s, gdb.execute("show convenience", to_string=True).split('\n'))
+        vars = [s.split(' = ')[0] for s in vars]
+        vars = [s[1:] for s in vars if mvar.match(s)]
+        return vars
+
+ConvenienceVarPrint()
+
 # Define a mysql command prefix for all mysql related command
 gdb.Command('mysql', gdb.COMMAND_DATA, prefix=True)
 
 #
-# Commands start here
+# MySQL Commands start here
 #
 
 #
@@ -131,7 +166,7 @@ gdb.Command('mysql', gdb.COMMAND_DATA, prefix=True)
 class DigestPrinter(gdb.Command):
     """decode a statement digest to readable string"""
     def __init__ (self):
-        super (DigestPrinter, self).__init__ ("mysql digest", gdb.COMMAND_OBSCURE)
+        super (__class__, self).__init__ ("mysql digest", gdb.COMMAND_OBSCURE)
 
     def invoke(self, arg, from_tty):
         start_addr = gdb.parse_and_eval(arg)
@@ -920,26 +955,20 @@ class OptPathTraverser(gdb.Command, TreeWalker):
         return disttype.split('::')[-1]
 
     def get_access_path(self, apindex):
-        deque = self.context['m_access_path_state']
-        blocks = deque['m_blocks']
-        base = deque['m_begin_idx']
-        end = deque['m_end_idx']
-        block_elements = deque['block_elements']
-        return blocks[(base + apindex) / block_elements]['elements'][(base + apindex) % block_elements]
+        array = self.context['m_access_path_state']['m_array']
+        return array[apindex]
 
     def show_pq_opt_Path(self, val):
         distinfo = val['distinfo']
         self.distinfo_to_str(distinfo)
         apindex = int(val['access_path_state'])
         access_type = str(apindex)
-        properties = str(val['properties'])
-        properties = properties.replace('pq::opt::','')
         #access_path =
         #self.context['m_access_path_state']['m_array'][apindex]['access_path']
         access_path = self.get_access_path(apindex)['access_path']
         access_type = str(access_path['type']).split('::')[-1]
         access_type += table_name_from_access_path(access_path)
-        return access_type + ': ' + self.distinfo_to_str(distinfo) + ', ' + str(properties)
+        return access_type + ': ' + self.distinfo_to_str(distinfo)
 OptPathTraverser()
 
 #
@@ -990,8 +1019,8 @@ class ListPrinter(object):
     def to_string(self):
         return '%s' % self.typename if self.val['elements'] != 0 else 'empty %s' % self.typename
 
-class mem_root_arrayPrinter(object):
-    """Print List a mem_root_array"""
+class Mem_root_arrayPrinter(object):
+    """Print List a Mem_root_array"""
 
     class _iterator(PrinterIterator):
         def __init__(self, nodetype, array, size):
@@ -1022,6 +1051,44 @@ class mem_root_arrayPrinter(object):
 
     def to_string(self):
         return '%s' % self.typename if self.val['m_size'] != 0 else 'empty %s' % self.typename
+
+class Prealloced_arrayPrinter(object):
+    """Print List a Prealloced_array"""
+
+    class _iterator(PrinterIterator):
+        def __init__(self, nodetype, array, size):
+            self.nodetype = nodetype
+            self.array = array
+            self.size = size
+            self.index = 0
+            self.autoncvar = AutoNumCVar()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index == self.size:
+                raise StopIteration
+            elt = self.array[self.index]
+            self.index += 1
+            val, cvname = expr_node_value(elt.cast(self.nodetype), self.autoncvar)
+            return (cvname, '(%s) %s' % (val.dynamic_type, val))
+
+    def __init__(self, val):
+        self.typename = val.type
+        self.val = val
+
+    def children(self):
+        nodetype = self.typename.template_argument(0)
+        inline_size = self.val['m_inline_size']
+        return self._iterator(nodetype, self.val['m_buff'] if inline_size >= 0 else self.val['ext']['m_array_ptr'], self.size())
+
+    def size(self):
+        inline_size = self.val['m_inline_size']
+        return inline_size if inline_size >= 0 else self.val['m_ext']['m_alloced_size']
+
+    def to_string(self):
+        return '%s' % self.typename if self.size() != 0 else 'empty %s' % self.typename
 
 class Bounds_checked_arrayPrinter(object):
     """Print a Bounds_checked_array"""
@@ -1129,6 +1196,7 @@ class AccessPathPrinter(object):
         apfield = find_access_path_struct(self.val)
         s += 'u = {' + apfield.name + ' = ' + str(self.val['u'][apfield.name]) + '}}'
         return s
+
 class Func_ptrPrinter(object):
     """Print actual Item type in Func_ptr"""
     def __init__(self, val):
@@ -1149,6 +1217,14 @@ class Func_ptrPrinter(object):
         return '(%s) %s -> (%s) %s with %s' % (
             copy_from.dynamic_type, copy_from, copy_to.dynamic_type, copy_to, bits_str)
 
+class mysql_mutex_t_Printer(object):
+    """Print mysql_mutex_t, just print a native lock number"""
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        return "{lock = %d}" % self.val['m_mutex']['m_u']['m_native']['__data']['__lock']
+
 import gdb.printing
 def build_pretty_printer():
     pp = gdb.printing.RegexpCollectionPrettyPrinter(
@@ -1156,9 +1232,11 @@ def build_pretty_printer():
     pp.add_printer('List', '^List<.*>$', ListPrinter)
     pp.add_printer('mem_root_deque', '^mem_root_deque<.*>$', mem_root_dequePrinter)
     pp.add_printer('AccessPath', '^AccessPath$', AccessPathPrinter)
-    pp.add_printer('Mem_root_array', '^Mem_root_array<.*>$', mem_root_arrayPrinter)
+    pp.add_printer('Mem_root_array', '^Mem_root_array<.*>$', Mem_root_arrayPrinter)
+    pp.add_printer('Prealloced_array', '^Prealloced_array<.*>$', Prealloced_arrayPrinter)
     pp.add_printer('Bounds_checked_array', '^Bounds_checked_array<.*>$', Bounds_checked_arrayPrinter)
     pp.add_printer('Func_ptr', '^Func_ptr$', Func_ptrPrinter)
+    pp.add_printer('mysql_mutex_t', '^mysql_mutex_t$', mysql_mutex_t_Printer)
     return pp
 
 gdb.printing.register_pretty_printer(
