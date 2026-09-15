@@ -23,6 +23,7 @@ Bounds_checked_array
 """
 from __future__ import print_function # python2.X support
 import re
+import struct
 import gdb
 #
 # A class to generate an unique gdb convenience variable name
@@ -351,6 +352,1629 @@ class ThreadOverview(gdb.Command):
            gdb.write("[%s] %s\n" % (','.join([str(i) for i in nums_thr]), funcs))
 ThreadOverview()
 
+###
+### bthread commands
+###
+
+"""
+bthread stack inspection commands for gdb, core-dump friendly.
+
+Unlike extra/incubator-brpc/incubator-brpc-1.0.0/tools/gdb_bthread_stack.py
+(which requires a *live* process because it calls bthread::get_all_bthreads()
+and switches $rip/$rsp/$rbp then relies on gdb's built-in `bt`), the
+commands here only ever *read* memory, and they unwind manually by walking
+the saved frame-pointer (rbp) chain. That makes them work equally well on:
+  - a live process (`gdb -p <pid>`)
+  - a core file (`gdb <binary> <core>`)
+
+All commands live under the 'bthread' prefix command (run 'help bthread' to
+list every subcommand with a one-line summary, or 'help bthread <sub>' for
+the full help of one subcommand).
+
+Get Started:
+    (gdb) source debug_tools/gdb/bthread_stack.py
+    (gdb) bthread ls                 # list all bthreads currently known to
+                                      # the bthread runtime (from the
+                                      # ResourcePool<TaskMeta> slab allocator)
+                                      # -- same as 'info bthreads'
+    (gdb) bthread bt <bthread_id>     # print the call stack of one bthread,
+                                      # identified by its numeric bthread_id
+                                      # (the same id you see in
+                                      # information_schema / Vio::bthread_id /
+                                      # THD::m_created_bthread_id etc.)
+    (gdb) bthread search <keyword>    # list bthreads whose stack contains a
+                                      # function name matching keyword
+                                      # (case-insensitive substring match)
+    (gdb) bthread arg <id> <frame> <arg-index> <type> [rbp-offset]
+                                      # recover a spilled argument from a
+                                      # suspended bthread frame
+    (gdb) bthread switch <bthread_id> # (live process only) borrow the
+                                      # current gdb thread to inspect a
+                                      # bthread with full native gdb power
+                                      # (info locals, frame, p, ...)
+    (gdb) bthread restore             # undo 'bthread switch' (usually
+                                      # automatic -- see its help)
+
+Notes:
+  - A bthread_id can be given in decimal or hex (0x...).
+  - If the bthread is currently *actually running* on some pthread (i.e. it
+    was the one executing when the core was generated, or is running live),
+    its saved ContextualStack does NOT reflect its live registers.
+    `bthread bt` detects this automatically (by scanning every LWP's
+    thread-local `bthread::tls_task_group->_cur_meta`) and, instead of
+    printing a possibly-garbage unwind, tells you which gdb `thread <n>`
+    it is running on so you can run `thread <n>` + `bt full` there for the
+    real (register-accurate) call stack.
+  - If a bthread has no stack (task_meta.stack == 0x0), it has either never
+    been scheduled onto a stack yet, or its stack has already been recycled
+    into the free stack pool after finishing.
+"""
+BTHREAD_STACKTYPE_UNKNOWN = 0
+BTHREAD_STACKTYPE_PTHREAD = 1
+
+MAX_UNWIND_FRAMES = 64
+
+# --- Why this file never lets gdb "materialize" a BlockGroup/Block value ---
+#
+# butil::ResourcePool<bthread::TaskMeta>::BlockGroup embeds
+# `butil::atomic<Block*> blocks[65536]` -> sizeof(BlockGroup) == 524296
+# bytes. Whenever gdb is asked to produce a *value* of this type (e.g. by
+# dereferencing a BlockGroup* and then chasing a scalar field such as
+# `.nblock`), it fails with a confusing "There is no member named nblock."
+# instead of a size-limit error. Root cause, confirmed empirically:
+#   - `print *block_group_ptr`            -> works, prints every field.
+#   - `block_group_ptr->nblock`           -> "no member named nblock"
+#   - Python: bg.dereference()['nblock'] -> same error
+#   - Python: bg.dereference().type.fields() -> returns [] (!)
+# i.e. gdb's *value* (not type) machinery treats this 512KB struct as an
+# "incomplete type" once you try to select a single field out of a fully
+# materialized value of it -- and raising `max-value-size` does NOT fix
+# this (verified: still fails with `set max-value-size unlimited`), so
+# this is a harder internal limit than the max-value-size knob.
+#
+# The `_resource_pool_task_meta_expr()` lookup below sidesteps this because
+# it only ever does pointer arithmetic and address-of-field access (gdb's
+# lenient `.`/`->` on a pointer decays an array field straight to its
+# address without loading the whole parent struct), never fully
+# dereferencing a BlockGroup/Block as a value. That's why it has always
+# worked for get_one_bthread()'s O(1) lookup.
+#
+# For _iter_all_task_metas(), which needs the scalar counters
+# BlockGroup::nblock and Block::nitem (to know how many blocks/items are
+# live), we avoid the gdb value machinery entirely and read raw bytes off
+# the inferior/core memory instead. Layout (confirmed via `ptype /o` and
+# cross-checked against a `print *block_group_ptr` dump):
+#   BlockGroup { atomic<unsigned long> nblock;      // offset 0, 8 bytes
+#                atomic<Block*> blocks[65536]; }     // offset 8
+#   Block      { char items[40960];                  // offset 0
+#                size_t nitem; }                      // offset 40960, 8 bytes
+
+
+_BLOCKGROUP_NBLOCK_OFFSET = 0
+_BLOCKGROUP_BLOCKS_OFFSET = 8
+_BLOCK_NITEM_OFFSET = 40960
+
+
+def _read_u64(inferior, addr):
+    return struct.unpack("<Q", bytes(inferior.read_memory(addr, 8)))[0]
+
+
+def _resource_pool_task_meta_expr(group, block, item):
+    return (
+        "*(('bthread::TaskMeta' *)((*(*(('butil::atomic<"
+        "butil::ResourcePool<bthread::TaskMeta>::Block*>' *)"
+        "((*((*((('butil::static_atomic<"
+        "butil::ResourcePool<bthread::TaskMeta>::BlockGroup*>' *)"
+        "('butil::ResourcePool<bthread::TaskMeta>::_block_groups')) + {g})).val))"
+        ".blocks) + {b}))._M_b._M_p).items) + {i})"
+    ).format(g=group, b=block, i=item)
+
+
+def _block_group_ptr(group):
+    """Address of BlockGroup #group (0 if that slot was never allocated)."""
+    return int(
+        gdb.parse_and_eval(
+            "'butil::ResourcePool<bthread::TaskMeta>::_block_groups'[{g}].val".format(
+                g=group
+            )
+        )
+    )
+
+
+def _iter_all_task_metas():
+    """Yield every live bthread::TaskMeta found in the ResourcePool slabs.
+
+    Pure memory walk (no inferior function calls, no full-value
+    materialization of BlockGroup/Block -- see the note above), safe on a
+    core file.
+    """
+    inferior = gdb.selected_inferior()
+    groups = int(
+        gdb.parse_and_eval(
+            "'butil::ResourcePool<bthread::TaskMeta>::_ngroup'"
+        )["val"]
+    )
+    for group in range(groups):
+        bg_ptr = _block_group_ptr(group)
+        if bg_ptr == 0:
+            continue
+        blocks = _read_u64(inferior, bg_ptr + _BLOCKGROUP_NBLOCK_OFFSET)
+        for block in range(blocks):
+            block_ptr_addr = (
+                bg_ptr + _BLOCKGROUP_BLOCKS_OFFSET + block * 8
+            )
+            block_ptr = _read_u64(inferior, block_ptr_addr)
+            if block_ptr == 0:
+                continue
+            items = _read_u64(inferior, block_ptr + _BLOCK_NITEM_OFFSET)
+            for item in range(items):
+                task_meta = gdb.parse_and_eval(
+                    _resource_pool_task_meta_expr(group, block, item)
+                )
+                yield task_meta
+
+
+def _is_valid_task_meta(task_meta):
+    version_tid = int(task_meta["tid"]) >> 32
+    version_butex = int(gdb.parse_and_eval(
+        "*(uint32_t *){}".format(task_meta["version_butex"])
+    ))
+    return version_tid == version_butex
+
+
+def get_one_bthread(bthread_id):
+    """O(1) lookup of a TaskMeta by bthread_id, using the resource_id encoded
+    in the low 32 bits of bthread_id to index directly into the slab."""
+    resource_id = bthread_id & 0xFFFFFFFF
+    block_index = resource_id // 256
+    group_index = block_index >> 16
+    offset = resource_id - block_index * 256
+    task_meta = gdb.parse_and_eval(
+        _resource_pool_task_meta_expr(group_index, block_index, offset)
+    )
+    if not _is_valid_task_meta(task_meta):
+        return None
+    return task_meta
+
+
+def _sym(addr):
+    try:
+        s = gdb.execute("info symbol 0x{:x}".format(addr), to_string=True).strip()
+        return s
+    except gdb.error as e:
+        return "?? ({})".format(e)
+
+
+def _source_line(addr):
+    """Return 'file:line' for `addr`, or None if no line info is available.
+
+    `addr` should be the address you actually want to attribute (for a
+    return address, pass pc-1 so the lookup lands inside the call site's
+    statement rather than the instruction after the call).
+    """
+    try:
+        sal = gdb.find_pc_line(addr)
+    except gdb.error:
+        return None
+    if sal is None or sal.symtab is None or sal.line == 0:
+        return None
+    return "{}:{}".format(sal.symtab.filename, sal.line)
+
+
+def _func_name(addr):
+    """Return just the function name containing `addr` (no offset/section)."""
+    fn = _function_range(addr)
+    if fn is not None:
+        return fn[0]
+    return None
+
+
+def _sym_with_line(addr, is_return_address=False):
+    """Resolve `addr` to a human-readable frame description.
+
+    When source line info is available, print a compact
+    'function at file:line' (dropping the verbose 'info symbol' tail of
+    '+ offset in section .text of <binary>'). Otherwise fall back to the
+    full 'info symbol' output so no information is lost.
+    """
+    # For a return address, the pc points *after* the call, so look up the
+    # line/function for pc-1 to attribute it to the call site.
+    lookup = addr - 1 if (is_return_address and addr > 0) else addr
+    line = _source_line(lookup)
+    if line is not None:
+        name = _func_name(lookup) or _func_name(addr)
+        if name is not None:
+            return "{} at {}".format(name, line)
+        # Have a line but no clean function name: keep info symbol + line.
+        return "{} at {}".format(_sym(addr), line)
+    return _sym(addr)
+
+
+def _bthread_context(task_meta):
+    """Return (rip, rbp, rsp) saved in a suspended bthread's ContextualStack.
+
+    Layout matches bthread_make_fcontext's x86_64 save area, consistent
+    with extra/incubator-brpc's gdb_bthread_stack.py: the ContextualStack's
+    `context` pointer + 6*8/7*8 holds saved rbp/rip, and +8*8 is the
+    restored rsp.
+    """
+    stack = task_meta["stack"]
+    if str(stack) == "0x0":
+        return None
+    context = gdb.parse_and_eval(
+        "(*(('bthread::ContextualStack' *){})).context".format(stack)
+    )
+    rip = int(gdb.parse_and_eval("*(uint64_t*)({}+7*8)".format(context)))
+    rbp = int(gdb.parse_and_eval("*(uint64_t*)({}+6*8)".format(context)))
+    rsp = int(gdb.parse_and_eval("({}+8*8)".format(context)))
+    return rip, rbp, rsp
+
+
+def _bthread_full_context(task_meta):
+    """Return the full callee-saved register set saved in a suspended
+    bthread's ContextualStack, as a dict of {reg_name: value}.
+
+    x86-64 save-area layout (confirmed against extra/incubator-brpc's
+    gdb_bthread_stack.py BthreadRegsCmd):
+        context+1*8 = r12    context+5*8 = rbx
+        context+2*8 = r13    context+6*8 = rbp
+        context+3*8 = r14    context+7*8 = rip  (return address)
+        context+4*8 = r15    rsp = context + 8*8
+    The System V AMD64 callee-saved set is {rbx, rbp, r12, r13, r14, r15},
+    plus rip/rsp to define the frame -- restoring all of them lets gdb's
+    native unwinder compute local variables that live in those registers.
+    """
+    stack = task_meta["stack"]
+    if str(stack) == "0x0":
+        return None
+    context = gdb.parse_and_eval(
+        "(*(('bthread::ContextualStack' *){})).context".format(stack)
+    )
+
+    def _u64(off):
+        return int(gdb.parse_and_eval("*(uint64_t*)({}+{}*8)".format(context, off)))
+
+    return {
+        "r12": _u64(1),
+        "r13": _u64(2),
+        "r14": _u64(3),
+        "r15": _u64(4),
+        "rbx": _u64(5),
+        "rbp": _u64(6),
+        "rip": _u64(7),
+        "rsp": int(gdb.parse_and_eval("({}+8*8)".format(context))),
+    }
+
+
+# The bottom of every bthread stack is entered through these functions;
+# anything the unwinder produces *above* them is garbage (the fcontext
+# stack base has no valid CFI/rbp terminator, so gdb keeps mis-decoding
+# leftover bytes as frames). We stop counting valid frames once we've
+# passed one of these.
+_BTHREAD_STACK_BOTTOM_FUNCS = (
+    "bthread_make_fcontext",
+    "bthread::TaskGroup::task_runner",
+)
+
+
+def _valid_frame_count(rip, rbp, max_frames=MAX_UNWIND_FRAMES):
+    """Count how many frames are genuinely part of this bthread's stack.
+
+    Walk the rbp chain (same logic as `bthread bt`) and count frames whose
+    pc resolves to a real function, stopping as soon as we either:
+      - hit a pc with no resolvable function (a '?? ()' garbage frame), or
+      - just consumed a known stack-bottom function (task_runner /
+        bthread_make_fcontext).
+    The returned count is suitable as the N in gdb's `bt <N>`, so the
+    native backtrace never spills into the bogus frames past the stack
+    base.
+    """
+    frames = _walk_rbp_chain(rip, rbp, max_frames)
+    count = 0
+    for frame in frames:
+        # A 3-tuple means the walk hit an unreadable rbp and stopped.
+        if len(frame) == 3:
+            break
+        _, pc = frame
+        if pc is None:
+            break
+        name = _func_name(pc)
+        if name is None:
+            # '?? ()' -- past the real stack, stop before counting it.
+            break
+        count += 1
+        if any(bottom in name for bottom in _BTHREAD_STACK_BOTTOM_FUNCS):
+            break
+    return count if count > 0 else len(frames)
+
+
+def _running_bthreads():
+    """Return {bthread_id: gdb.InferiorThread} for currently running tasks.
+
+    Each worker pthread caches its TaskGroup in the thread-local
+    `bthread::tls_task_group`; TaskGroup::_cur_meta identifies the bthread
+    currently executing on that pthread. The selected gdb thread is restored
+    before returning.
+    """
+    inferior = gdb.selected_inferior()
+    original = gdb.selected_thread()
+    running = {}
+    try:
+        for thr in inferior.threads():
+            thr.switch()
+            try:
+                group = gdb.parse_and_eval("bthread::tls_task_group")
+                if int(group) == 0:
+                    continue
+                cur_meta = group["_cur_meta"]
+                if int(cur_meta) == 0:
+                    continue
+                running[int(cur_meta["tid"])] = thr
+            except (gdb.error, RuntimeError, ValueError):
+                continue
+    finally:
+        if original is not None:
+            original.switch()
+    return running
+
+
+def _find_running_lwp(bthread_id):
+    """Return the pthread/LWP currently executing `bthread_id`, if any."""
+    return _running_bthreads().get(bthread_id)
+
+
+def _walk_thread_stack(thr, max_frames=MAX_UNWIND_FRAMES):
+    """Return (frame_no, pc) pairs from a currently running pthread stack.
+
+    Returns [] (never raises) if the frames can't be obtained at all --
+    notably gdb.error('Selected thread is running.'), which happens on a
+    LIVE attach when this particular thread hasn't actually been stopped
+    (e.g. a brand new thread gdb hasn't fully synced yet, or non-stop
+    mode). Never happens on a core file (nothing is ever "running"
+    there), but callers must not assume a non-empty result either way.
+    """
+    original = gdb.selected_thread()
+    frames = []
+    try:
+        thr.switch()
+        frame = gdb.newest_frame()
+    except (gdb.error, RuntimeError):
+        frame = None
+    try:
+        frame_no = 0
+        while frame is not None and frame_no < max_frames:
+            try:
+                frames.append((frame_no, int(frame.pc())))
+                frame = frame.older()
+                frame_no += 1
+            except (gdb.error, RuntimeError):
+                break
+    finally:
+        if original is not None:
+            original.switch()
+    return frames
+
+
+def _walk_rbp_chain(rip, rbp, max_frames=MAX_UNWIND_FRAMES):
+    """Manually unwind via the classic frame-pointer chain:
+       [rbp+0] = saved rbp, [rbp+8] = return address.
+    Works identically on a live inferior or a core file since it is pure
+    memory reads, no register writes, no target-specific unwinder needed.
+    """
+    inferior = gdb.selected_inferior()
+    frames = [(0, rip)]
+    cur_rbp = rbp
+    frame_no = 1
+    for _ in range(max_frames):
+        try:
+            mem = inferior.read_memory(cur_rbp, 16)
+        except gdb.MemoryError as e:
+            frames.append((frame_no, None, "stop: cannot read rbp=0x{:x}: {}".format(cur_rbp, e)))
+            break
+        saved_rbp, ret_addr = struct.unpack("<QQ", bytes(mem[:16]))
+        frames.append((frame_no, ret_addr))
+        if saved_rbp == 0 or saved_rbp <= cur_rbp:
+            break
+        cur_rbp = saved_rbp
+        frame_no += 1
+    return frames
+
+
+_ARGUMENT_REGISTERS = (
+    ("rdi", "edi", "di", "dil"),
+    ("rsi", "esi", "si", "sil"),
+    ("rdx", "edx", "dx", "dl"),
+    ("rcx", "ecx", "cx", "cl"),
+    ("r8", "r8d", "r8w", "r8b"),
+    ("r9", "r9d", "r9w", "r9b"),
+)
+
+
+def _saved_frame_at(rip, rbp, target_frame):
+    """Return (pc, rbp) for a frame number from `_walk_rbp_chain`."""
+    inferior = gdb.selected_inferior()
+    pc = rip
+    frame_rbp = rbp
+    for _ in range(target_frame):
+        mem = inferior.read_memory(frame_rbp, 16)
+        saved_rbp, return_address = struct.unpack("<QQ", bytes(mem))
+        if saved_rbp == 0 or saved_rbp <= frame_rbp:
+            return None
+        frame_rbp = saved_rbp
+        pc = return_address
+    return pc, frame_rbp
+
+
+def _function_range(pc):
+    """Return (name, start, end) of the function containing `pc`."""
+    block = gdb.block_for_pc(pc)
+    while block is not None:
+        if block.function is not None:
+            return block.function.print_name, int(block.start), int(block.end)
+        block = block.superblock
+    return None
+
+
+def _parse_displacement(text):
+    if not text:
+        return 0
+    return int(text, 0)
+
+
+def _detect_argument_rbp_offset(function_start, function_end, arg_index):
+    """Find a canonical x86-64 argument-register spill before the first call."""
+    registers = _ARGUMENT_REGISTERS[arg_index]
+    end = min(function_end, function_start + 256)
+    instructions = gdb.selected_frame().architecture().disassemble(
+        function_start, end
+    )
+
+    for instruction in instructions:
+        asm = instruction["asm"].lower()
+        if re.search(r"\bcall\w*\b", asm):
+            break
+        for register in registers:
+            # AT&T: mov %rdi,-0x8(%rbp)
+            match = re.search(
+                r"\bmov\w*\s+%{}\s*,\s*([+-]?(?:0x[0-9a-f]+|[0-9]+))"
+                r"\(%rbp\)".format(register),
+                asm,
+            )
+            if match:
+                return _parse_displacement(match.group(1)), asm
+
+            # Intel: mov QWORD PTR [rbp-0x8],rdi
+            match = re.search(
+                r"\bmov\w*\s+(?:[a-z]+\s+ptr\s+)?"
+                r"\[rbp([+-](?:0x[0-9a-f]+|[0-9]+))\]\s*,\s*{}\b".format(
+                    register
+                ),
+                asm,
+            )
+            if match:
+                return _parse_displacement(match.group(1)), asm
+    return None
+
+
+def _lookup_argument_type(type_name):
+    """Parse a GDB type expression such as `THD *` without reading memory."""
+    if re.match(r"\A[A-Za-z_][A-Za-z0-9_:<>, \t*&\[\]]*\Z", type_name) is None:
+        raise ValueError("invalid characters in type")
+    return gdb.parse_and_eval("({})0".format(type_name)).type
+
+
+def _format_rbp_offset(offset):
+    if offset < 0:
+        return "rbp-0x{:x}".format(-offset)
+    if offset > 0:
+        return "rbp+0x{:x}".format(offset)
+    return "rbp"
+
+
+class BthreadCmd(gdb.Command):
+    """bthread -- prefix command for bthread (fiber) inspection.
+
+    All bthread inspection commands live under this prefix. Run without a
+    subcommand (or 'help bthread') to list every subcommand with a short
+    summary; run 'help bthread <subcommand>' for one subcommand's full
+    documentation.
+
+    SUBCOMMANDS
+        bthread ls                    list all known bthreads
+        bthread bt <id>                print one bthread's call stack
+                                        (read-only, works on core files)
+        bthread search <keyword>       find bthreads whose stack hits a
+                                        symbol matching <keyword>
+        bthread arg <id> <frame> <arg-index> <type> [rbp-offset]
+                                        recover a spilled argument
+                                        (read-only, works on core files)
+        bthread switch <id>             (live process only) borrow the
+                                        current gdb thread to inspect a
+                                        bthread with full native gdb power
+                                        (info locals, frame, p, ...)
+        bthread restore                 undo 'bthread switch' (usually
+                                        automatic -- see its help)
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(
+            self, "bthread", gdb.COMMAND_STACK, gdb.COMPLETE_NONE, True
+        )
+
+    def invoke(self, arg, from_tty):
+        # gdb >= 17.1 auto-prints every subcommand's help when a prefix
+        # command has no invoke() and is run bare (or with an unmatched
+        # sub-command name); older releases just silently do nothing in
+        # that case (typing 'bthread' alone prints nothing). Implementing
+        # invoke() ourselves and delegating to 'help bthread' gets the
+        # same listing on EVERY gdb version. This only ever runs for
+        # 'bthread' bare or an unmatched sub-command -- a real
+        # sub-command (e.g. 'bthread ls') dispatches straight to its own
+        # invoke() and never reaches here.
+        gdb.execute("help bthread", from_tty)
+
+
+class BthreadLsCmd(gdb.Command):
+    """bthread ls -- list all known bthreads.
+
+    List every bthread currently tracked by the bthread runtime's
+    ResourcePool<TaskMeta> slab allocator.
+
+    ARGUMENTS
+        none.
+
+    OUTPUT -- grouped by entry function, most common first
+        Bthreads are grouped by their ENTRY function (TaskMeta::fn, the
+        worker routine each was created with -- i.e. the bottom of its
+        call stack, fixed for its whole lifetime; NOT what it is
+        currently executing -- for the current/top frame use
+        `bthread bt <id>`, frame #0). Groups are sorted by count,
+        largest first. Each group prints as one row:
+            <function>[ [<count> bthreads]]   <id>[-<id>][, <id>...]
+        - function is printed in FULL (never truncated), left-aligned
+          and padded to a fixed-width column when it's short enough to
+          fit; a longer (e.g. templated) name simply overflows past
+          that column instead of being cut, so the ids that follow are
+          pushed right accordingly for that one row only.
+        - '[<count> bthreads]' is appended right after the function
+          name itself (not a separate column) when count > 1; omitted
+          entirely when count == 1 (a single occurrence needs no
+          marker).
+        - ids is a hex bthread_id list (feed to `bthread bt` /
+          `bthread switch`, decimal also works there); consecutive ids
+          are collapsed into a single 'a-b' range and always printed on
+          one single line, however long that ends up being (no
+          wrapping/truncation).
+
+    REQUIREMENTS
+        Works on BOTH a live process and a core file (pure memory scan,
+        no inferior function calls).
+
+    Also available as 'info bthreads' (same output), for discoverability
+    alongside gdb's built-in 'info threads'.
+
+    SEE ALSO
+        bthread bt, bthread search, bthread switch, info bthreads
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(self, "bthread ls", gdb.COMMAND_STACK, gdb.COMPLETE_NONE)
+
+    def invoke(self, arg, tty):
+        _bthread_ls_impl()
+
+
+def _fn_name(fn_val):
+    """Human-friendly name for a TaskMeta::fn pointer value: just the
+    function name, no leading address and no enclosing '<...>' (unlike
+    gdb's default pointer formatting, e.g. '0x55556... <name+0x10>')."""
+    addr = int(fn_val)
+    name = _func_name(addr)
+    if name is not None:
+        return name
+    # No debug-info-based name available; fall back to whatever gdb's
+    # default formatting put inside the '<...>' (still has a symbol name
+    # in the common case, just without file:line), or the raw text if
+    # even that isn't there.
+    text = str(fn_val)
+    match = re.search(r"<([^>+]+)", text)
+    return match.group(1) if match else text
+
+
+def _collapse_id_ranges(ids):
+    """Collapse a sorted list of ints into ['a', 'b-c', ...] hex strings,
+    merging consecutive runs (id[i+1] == id[i]+1) into a single range."""
+    ranges = []
+    start = prev = ids[0]
+    for cur in ids[1:]:
+        if cur == prev + 1:
+            prev = cur
+            continue
+        ranges.append((start, prev))
+        start = prev = cur
+    ranges.append((start, prev))
+    return [
+        "0x{:x}".format(lo) if lo == hi else "0x{:x}-0x{:x}".format(lo, hi)
+        for lo, hi in ranges
+    ]
+
+
+# Layout of a 'bthread ls' row: <function[ [count bthreads]] padded to
+# _FUNC_COL_WIDTH>  <ids...>. There is no separate "count" column --
+# the count is folded into the function field itself as a
+# '[N bthreads]' suffix. Neither the function name nor the ids list is
+# ever truncated/wrapped -- a long name just overflows past the
+# column (only that row's ids shift right), and all ids are always
+# printed on that same single line.
+_FUNC_COL_WIDTH = 60
+
+
+def _format_function_field(fn_name, count):
+    """Function name, with a '[N bthreads]' suffix appended when this
+    function is the entry point of more than one bthread (count == 1
+    gets no suffix -- a lone occurrence needs no marker)."""
+    if count > 1:
+        return "{} [{} bthreads]".format(fn_name, count)
+    return fn_name
+
+
+def _format_ids(ids):
+    """Comma-joined collapsed id ranges, always as a single line (no
+    wrapping/truncation, however many ids there are)."""
+    return ", ".join(_collapse_id_ranges(sorted(ids)))
+
+
+def _bthread_ls_impl():
+    """Shared listing logic behind 'bthread ls' and 'info bthreads'."""
+    groups = {}  # function name -> list of bthread ids
+    total = 0
+    for task_meta in _iter_all_task_metas():
+        if not _is_valid_task_meta(task_meta):
+            continue
+        if int(task_meta["attr"]["stack_type"]) == BTHREAD_STACKTYPE_UNKNOWN:
+            continue
+        fn_name = _fn_name(task_meta["fn"])
+        groups.setdefault(fn_name, []).append(int(task_meta["tid"]))
+        total += 1
+
+    print("{:<{fw}}  {}".format("function", "ids", fw=_FUNC_COL_WIDTH))
+    for fn_name, ids in sorted(
+        groups.items(), key=lambda kv: (-len(kv[1]), kv[0])
+    ):
+        fn_field = _format_function_field(fn_name, len(ids))
+        print("{:<{fw}}  {}".format(fn_field, _format_ids(ids), fw=_FUNC_COL_WIDTH))
+    print("total: {} bthreads, {} distinct functions".format(total, len(groups)))
+
+
+class InfoBthreadsCmd(gdb.Command):
+    """info bthreads -- list all known bthreads (alias of 'bthread ls').
+
+    Same output as 'bthread ls', registered under gdb's built-in 'info'
+    prefix so it shows up alongside 'info threads' and friends, and is
+    discoverable via 'info' tab-completion / 'help info'.
+
+    ARGUMENTS
+        none.
+
+    SEE ALSO
+        bthread ls, bthread bt, bthread search, bthread switch
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(
+            self, "info bthreads", gdb.COMMAND_STATUS, gdb.COMPLETE_NONE
+        )
+
+    def invoke(self, arg, tty):
+        _bthread_ls_impl()
+
+
+class BthreadBtCmd(gdb.Command):
+    """bthread bt <bthread_id> -- print a bthread's call stack (read-only).
+
+    Print the call stack of one suspended bthread by manually walking the
+    saved frame-pointer (rbp) chain in its ContextualStack. Each frame is
+    shown as 'function at file:line' when debug info is available, else it
+    falls back to the raw 'info symbol' output.
+
+    ARGUMENTS
+        <bthread_id>   numeric bthread id, decimal or 0x-hex (see
+                       'bthread ls' / 'bthread search').
+
+    REQUIREMENTS
+        Works on BOTH a live process and a core file. It only READS memory
+        and never writes CPU registers, so it is safe to run repeatedly
+        and on cores. It does NOT give you 'info locals' / 'p <var>' --
+        for that on a LIVE process use 'bthread switch'.
+
+    DECLINED / SPECIAL CASES (an explanation is printed)
+        * bthread on a pthread stack   -> find its LWP, 'thread <n>' + bt.
+        * bthread currently running     -> its saved context is stale; the
+          owning LWP (gdb thread <n>) is reported, use 'thread <n>' + bt.
+        * bthread has no stack          -> never scheduled, or recycled.
+
+    SEE ALSO
+        bthread switch (live, with locals), bthread ls, bthread search,
+        bthread arg
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(self, "bthread bt", gdb.COMMAND_STACK, gdb.COMPLETE_NONE)
+
+    def invoke(self, arg, tty):
+        arg = arg.strip()
+        if not arg:
+            print("usage: bthread bt <bthread_id>  (decimal or 0x-hex), see 'bthread ls'")
+            return
+        try:
+            bthread_id = int(arg, 0)
+        except ValueError:
+            print("invalid bthread_id: {}".format(arg))
+            return
+
+        task_meta = get_one_bthread(bthread_id)
+        if task_meta is None:
+            print("bthread_id {} (0x{:x}) not found or stale (version mismatch, "
+                  "likely already recycled/reused)".format(bthread_id, bthread_id))
+            return
+
+        stack_type = int(task_meta["attr"]["stack_type"])
+        if stack_type == BTHREAD_STACKTYPE_PTHREAD:
+            print("bthread_id {} runs directly on a pthread (stack_type=PTHREAD); "
+                  "find its owning LWP and use 'thread <n>' + 'bt full' instead.".format(bthread_id))
+            return
+
+        running_thr = _find_running_lwp(bthread_id)
+        if running_thr is not None:
+            print(
+                "bthread_id {} (0x{:x}) is CURRENTLY RUNNING on LWP {} "
+                "(gdb thread {}) -- its saved ContextualStack is stale "
+                "(only updated when a bthread is scheduled OUT, not while "
+                "it's actually executing).".format(
+                    bthread_id, bthread_id, running_thr.ptid[1], running_thr.num
+                )
+            )
+            print(
+                "==> Use 'thread {}' then 'bt full' to get the real call "
+                "stack instead of this command.".format(running_thr.num)
+            )
+            return
+
+        ctx = _bthread_context(task_meta)
+        if ctx is None:
+            print("bthread_id {} has no saved stack (stack==0x0): either never "
+                  "scheduled yet, or already finished and its stack was recycled "
+                  "back into the free pool.".format(bthread_id))
+            return
+
+        rip, rbp, _rsp = ctx
+        frames = _walk_rbp_chain(rip, rbp)
+        for frame in frames:
+            if len(frame) == 3:
+                frame_no, _, msg = frame
+                print(msg)
+                continue
+            frame_no, ret_addr = frame
+            if ret_addr is None:
+                continue
+            # frame #0 is the live PC; frames >=1 hold return addresses, so
+            # resolve the source line against the call site (pc-1).
+            print("#{:<3} 0x{:016x}  {}".format(
+                frame_no,
+                ret_addr,
+                _sym_with_line(ret_addr, is_return_address=(frame_no > 0)),
+            ))
+
+
+class BthreadArgCmd(gdb.Command):
+    """bthread arg <bthread_id> <frame_no> <arg_index> <type> [rbp_offset]
+    -- recover a spilled function argument from a suspended bthread frame.
+
+    Recover an x86-64 System V argument that was spilled into an
+    RBP-relative stack slot, for a frame in a suspended bthread's saved
+    stack. Useful when 'bthread switch' + 'info args' is unavailable (e.g.
+    on a core file) or the argument was optimized into a stack slot.
+
+    ARGUMENTS
+        <bthread_id>   numeric bthread id, decimal or 0x-hex.
+        <frame_no>     frame index as printed by 'bthread bt' (0-based).
+        <arg_index>    0-based integer/pointer argument position, mapping
+                       to the SysV registers: 0=rdi 1=rsi 2=rdx 3=rcx
+                       4=r8 5=r9.
+        <type>         gdb type of the argument, quoted, e.g. 'THD *'.
+                       Only scalar/pointer types up to 8 bytes.
+        [rbp_offset]   optional. If omitted, the function prologue is
+                       disassembled up to its first call to auto-detect the
+                       spill slot. If given (e.g. -8), that rbp-relative
+                       slot is read directly.
+
+    RESULT
+        Prints the decoded value and also stores it in the convenience
+        variable $bthread_arg for further use (e.g. 'p *$bthread_arg').
+
+    REQUIREMENTS
+        Works on BOTH a live process and a core file (read-only). Only the
+        first 6 integer/pointer args (register args) are recoverable, and
+        only if they were spilled to the stack.
+
+    EXAMPLE
+        (gdb) bthread arg 4294973925 28 0 'THD *'
+        (gdb) bthread arg 4294973925 28 0 'THD *' -8      # manual offset
+
+    SEE ALSO
+        bthread bt, bthread switch (live: 'info args' is easier)
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(
+            self, "bthread arg", gdb.COMMAND_STACK, gdb.COMPLETE_NONE
+        )
+
+    def invoke(self, arg, tty):
+        try:
+            args = gdb.string_to_argv(arg)
+        except gdb.error as error:
+            print("invalid arguments: {}".format(error))
+            return
+
+        if len(args) not in (4, 5):
+            print(
+                "usage: bthread arg <bthread_id> <frame_no> <arg_index> "
+                "<type> [rbp_offset]"
+            )
+            print("example: bthread arg 4294973925 28 0 'THD *'")
+            print("manual:  bthread arg 4294973925 28 0 'THD *' -8")
+            return
+
+        try:
+            bthread_id = int(args[0], 0)
+            frame_no = int(args[1], 0)
+            arg_index = int(args[2], 0)
+            explicit_offset = int(args[4], 0) if len(args) == 5 else None
+        except ValueError as error:
+            print("invalid numeric argument: {}".format(error))
+            return
+
+        if frame_no < 0 or frame_no > MAX_UNWIND_FRAMES:
+            print("frame_no must be between 0 and {}".format(MAX_UNWIND_FRAMES))
+            return
+        if arg_index < 0 or arg_index >= len(_ARGUMENT_REGISTERS):
+            print("arg_index must be between 0 and 5 on x86-64 SysV")
+            return
+
+        type_name = args[3]
+        try:
+            argument_type = _lookup_argument_type(type_name)
+            type_size = int(argument_type.sizeof)
+        except (gdb.error, RuntimeError, TypeError, ValueError) as error:
+            print("invalid or incomplete type {!r}: {}".format(type_name, error))
+            return
+        if type_size <= 0 or type_size > 8:
+            print(
+                "unsupported argument type size {}: only scalar and pointer "
+                "values up to 8 bytes are supported".format(type_size)
+            )
+            return
+
+        task_meta = get_one_bthread(bthread_id)
+        if task_meta is None:
+            print(
+                "bthread_id {} (0x{:x}) not found or stale".format(
+                    bthread_id, bthread_id
+                )
+            )
+            return
+
+        stack_type = int(task_meta["attr"]["stack_type"])
+        if stack_type == BTHREAD_STACKTYPE_PTHREAD:
+            print("bthread_id {} uses a pthread stack; use native gdb frames".format(
+                bthread_id
+            ))
+            return
+
+        running_thr = _find_running_lwp(bthread_id)
+        if running_thr is not None:
+            print(
+                "bthread_id {} is currently running on gdb thread {}; its "
+                "saved stack is stale. Use 'thread {}', 'frame {}', and "
+                "'info args' instead.".format(
+                    bthread_id, running_thr.num, running_thr.num, frame_no
+                )
+            )
+            return
+
+        ctx = _bthread_context(task_meta)
+        if ctx is None:
+            print("bthread_id {} has no saved stack".format(bthread_id))
+            return
+
+        rip, rbp, _ = ctx
+        try:
+            frame = _saved_frame_at(rip, rbp, frame_no)
+        except (gdb.error, gdb.MemoryError, RuntimeError, ValueError) as error:
+            print("cannot unwind to frame #{}: {}".format(frame_no, error))
+            return
+        if frame is None:
+            print("frame #{} is not present in the saved RBP chain".format(frame_no))
+            return
+
+        pc, frame_rbp = frame
+        function = _function_range(pc)
+        if function is None:
+            function_name = _sym(pc)
+            function_start = None
+            function_end = None
+        else:
+            function_name, function_start, function_end = function
+
+        detected_instruction = None
+        rbp_offset = explicit_offset
+        if rbp_offset is None:
+            if function_start is None:
+                print(
+                    "cannot determine the function containing frame #{}; "
+                    "specify rbp_offset explicitly".format(frame_no)
+                )
+                return
+            try:
+                detected = _detect_argument_rbp_offset(
+                    function_start, function_end, arg_index
+                )
+            except (gdb.error, RuntimeError, ValueError) as error:
+                print("cannot disassemble {}: {}".format(function_name, error))
+                return
+            if detected is None:
+                print(
+                    "cannot find a spill of argument #{} ({}) before the first "
+                    "call in {}; specify rbp_offset explicitly".format(
+                        arg_index,
+                        _ARGUMENT_REGISTERS[arg_index][0],
+                        function_name,
+                    )
+                )
+                return
+            rbp_offset, detected_instruction = detected
+
+        slot_address = frame_rbp + rbp_offset
+        try:
+            raw_bytes = bytes(
+                gdb.selected_inferior().read_memory(slot_address, type_size)
+            )
+            raw_value = int.from_bytes(raw_bytes, byteorder="little", signed=False)
+            value = gdb.Value(raw_value).cast(argument_type)
+            gdb.set_convenience_variable("bthread_arg", value)
+        except (gdb.error, gdb.MemoryError, RuntimeError, ValueError) as error:
+            print("cannot read argument at 0x{:x}: {}".format(slot_address, error))
+            return
+
+        print("bthread_id: {} (0x{:x})".format(bthread_id, bthread_id))
+        print("frame:      #{} {}".format(frame_no, function_name))
+        print("pc:         0x{:016x}".format(pc))
+        print("rbp:        0x{:016x}".format(frame_rbp))
+        print(
+            "argument:   #{} ({})".format(
+                arg_index, _ARGUMENT_REGISTERS[arg_index][0]
+            )
+        )
+        print(
+            "storage:    [{}] = 0x{:016x}".format(
+                _format_rbp_offset(rbp_offset), slot_address
+            )
+        )
+        if detected_instruction is not None:
+            print("detected:   {}".format(detected_instruction))
+        print("value:      ({}) {}".format(type_name, value))
+        print("saved as:   $bthread_arg")
+
+
+class BthreadSearchCmd(gdb.Command):
+    """bthread search <keyword> -- find bthreads whose stack hits a symbol.
+
+    Scan every known bthread and list those whose call stack contains a
+    frame with a function name matching <keyword> (case-insensitive
+    substring match). Hits are grouped by their matched frame -- same
+    '#<frame_no> function at file:line' text (no raw address; falls back
+    to 'info symbol' output when no debug info is available) -- and
+    printed the same way as `bthread ls`, most common first:
+        <matched frame>[ [<count> bthreads]]   <id>[-<id>][, <id>...]
+    See `bthread ls`'s help for the exact column/wrap/suffix rules
+    (they're shared with this command).
+
+    ARGUMENTS
+        <keyword>   substring to look for in frame function names, e.g.
+                    'RowExchange' or 'butex_wait'.
+
+    HOW STACKS ARE OBTAINED
+        * suspended bthread   -> unwound from its saved ContextualStack.
+        * currently running    -> unwound from the real pthread stack of the
+          LWP it runs on; on a LIVE process, if that particular LWP
+          hasn't actually been stopped yet (gdb reports "Selected thread
+          is running"), it is skipped instead of erroring out -- counted
+          under 'skipped'.
+        * pthread-stack bthread that is not running -> skipped (no usable
+          saved stack); counted under 'skipped'.
+
+    REQUIREMENTS
+        Works on BOTH a live process and a core file (read-only); never
+        raises even if a live LWP can't be unwound (see above).
+
+    SEE ALSO
+        bthread ls, bthread bt, bthread switch
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(
+            self, "bthread search", gdb.COMMAND_STACK, gdb.COMPLETE_NONE
+        )
+
+    def invoke(self, arg, tty):
+        keyword = arg.strip()
+        if not keyword:
+            print("usage: bthread search <keyword>")
+            return
+
+        keyword_lower = keyword.lower()
+        running = _running_bthreads()
+        symbol_cache = {}
+        searched = 0
+        skipped = 0
+        groups = {}  # matched frame description -> list of bthread ids
+
+        for task_meta in _iter_all_task_metas():
+            if not _is_valid_task_meta(task_meta):
+                continue
+
+            stack_type = int(task_meta["attr"]["stack_type"])
+            if stack_type == BTHREAD_STACKTYPE_UNKNOWN:
+                continue
+
+            tid = int(task_meta["tid"])
+            searched += 1
+            thr = running.get(tid)
+
+            if thr is not None:
+                # See _walk_thread_stack: on a live attach this can come
+                # back [] if gdb reports "Selected thread is running"
+                # for this particular thread (not stopped yet) -- treat
+                # that the same as any other unusable stack.
+                frames = _walk_thread_stack(thr)
+                if not frames:
+                    skipped += 1
+                    continue
+            elif stack_type == BTHREAD_STACKTYPE_PTHREAD:
+                skipped += 1
+                continue
+            else:
+                try:
+                    ctx = _bthread_context(task_meta)
+                    if ctx is None:
+                        skipped += 1
+                        continue
+                    rip, rbp, _ = ctx
+                    frames = _walk_rbp_chain(rip, rbp)
+                except (gdb.error, gdb.MemoryError, RuntimeError, ValueError):
+                    skipped += 1
+                    continue
+
+            matched_frame = None
+            for frame in frames:
+                if len(frame) != 2:
+                    continue
+                frame_no, pc = frame
+                if pc is None:
+                    continue
+                symbol = symbol_cache.get(pc)
+                if symbol is None:
+                    symbol = _sym(pc)
+                    symbol_cache[pc] = symbol
+                if keyword_lower in symbol.lower():
+                    matched_frame = (frame_no, pc, symbol)
+                    break
+
+            if matched_frame is None:
+                continue
+
+            frame_no, pc, _symbol = matched_frame
+            desc = "#{:<3} {}".format(
+                frame_no, _sym_with_line(pc, is_return_address=(frame_no > 0))
+            )
+            groups.setdefault(desc, []).append(tid)
+
+        print("searching bthread stacks for {!r} ...".format(keyword))
+        print("{:<{fw}}  {}".format("matched frame", "ids", fw=_FUNC_COL_WIDTH))
+        matched = 0
+        for desc, ids in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            matched += len(ids)
+            field = _format_function_field(desc, len(ids))
+            print("{:<{fw}}  {}".format(field, _format_ids(ids), fw=_FUNC_COL_WIDTH))
+
+        print(
+            "matched: {}, searched: {}, skipped(no usable stack): {}, "
+            "distinct frames: {}".format(matched, searched, skipped, len(groups))
+        )
+
+
+# Saved real register context of switched gdb thread(s), so that
+# `bthread switch` can be undone by `bthread restore`. Keyed by the gdb
+# global thread id (InferiorThread.global_num) it was taken on.
+#
+# INVARIANT: at most ONE entry lives here at any time. gdb's 'backtrace
+# limit' (used to hide the garbage frames past a bthread stack's base --
+# see _valid_frame_count) is a *global* gdb setting, not per-thread, so
+# it can only be correct for a single switched thread at once. Letting
+# two different gdb threads stay switched simultaneously would make the
+# limit silently wrong (truncated or garbage-showing) for whichever one
+# isn't the most recently switched. `bthread switch` enforces this by
+# auto-restoring any *other* thread's registers before switching a new
+# one; re-switching the SAME thread to a different bthread is exempt
+# (see the setdefault() below) since it doesn't add a second entry.
+_saved_thread_regs = {}
+
+# The global 'backtrace limit' gdb setting as it was before the first
+# active 'bthread switch', so it can be restored once no switched thread
+# remains. (gdb's backtrace limit is a global setting, not per-thread.)
+_original_backtrace_limit = None
+
+# Full System V AMD64 callee-saved set plus rip/rsp. Saving/restoring all
+# of these (not just rip/rbp/rsp) lets gdb's native unwinder correctly
+# recover locals held in rbx/r12-r15 in the switched-to bthread frames.
+_SWITCH_REGISTERS = ("rip", "rsp", "rbp", "rbx", "r12", "r13", "r14", "r15")
+
+
+def _read_registers(regs):
+    frame = gdb.selected_frame()
+    return {name: int(frame.read_register(name)) for name in regs}
+
+
+def _write_registers(values):
+    for name, value in values.items():
+        gdb.execute("set $%s = 0x%x" % (name, value & 0xFFFFFFFFFFFFFFFF),
+                    to_string=True)
+
+
+def _get_backtrace_limit():
+    """Return gdb's current 'backtrace limit' (0 means unlimited)."""
+    try:
+        out = gdb.execute("show backtrace limit", to_string=True)
+    except gdb.error:
+        return 0
+    match = re.search(r"(\d+)", out)
+    return int(match.group(1)) if match else 0
+
+
+def _set_backtrace_limit(n):
+    gdb.execute("set backtrace limit {}".format(n), to_string=True)
+
+
+def _restore_saved_registers(key):
+    """Write back one gdb thread's real registers, saved earlier by
+    'bthread switch' under gdb global thread id `key`.
+
+    Returns (thr_num, True) on success, (thr_num, False) if the write
+    failed or the thread no longer exists (the saved entry is put back
+    in the False case so it can be retried), or None if `key` was not
+    present in `_saved_thread_regs` at all.
+    """
+    entry = _saved_thread_regs.pop(key, None)
+    if entry is None:
+        return None
+    thr_num, saved = entry
+    original = gdb.selected_thread()
+    try:
+        target_thr = next(
+            t for t in gdb.selected_inferior().threads()
+            if t.global_num == key
+        )
+    except StopIteration:
+        # Thread no longer exists (e.g. it exited); nothing to write.
+        return (thr_num, False)
+    try:
+        target_thr.switch()
+        _write_registers(saved)
+        gdb.execute("flushregs", to_string=True)
+    except gdb.error as e:
+        _saved_thread_regs[key] = entry
+        print("bthread_stack: failed to auto-restore gdb thread {}: {}"
+              .format(thr_num, e))
+        return (thr_num, False)
+    finally:
+        if original is not None and original.is_valid():
+            original.switch()
+    return (thr_num, True)
+
+
+def _auto_restore_all(reason, keep_key=None):
+    """Restore every switched gdb thread except `keep_key` (if given).
+
+    This is the shared engine behind making 'bthread restore' OPTIONAL.
+    It is invoked automatically from three places:
+      - 'bthread switch' itself, before switching a different gdb thread
+        (keep_key = the thread about to be switched).
+      - the 'selected_context' event listener below, when the user
+        navigates away from a switched thread via 'thread <n>' (or any
+        other means gdb uses to change the selected thread).
+      - the hook-continue/step/next/.../advance CLI hooks below, just
+        before the inferior is actually resumed.
+    """
+    stale = [k for k in _saved_thread_regs if k != keep_key]
+    if not stale:
+        return
+    restored = []
+    for key in stale:
+        result = _restore_saved_registers(key)
+        if result is not None and result[1]:
+            restored.append(result[0])
+    if restored:
+        print("bthread_stack: auto-restored gdb thread(s) {} {}.".format(
+            ", ".join(str(n) for n in restored), reason))
+    if not _saved_thread_regs:
+        global _original_backtrace_limit
+        if _original_backtrace_limit is not None:
+            _set_backtrace_limit(_original_backtrace_limit)
+            _original_backtrace_limit = None
+
+
+def _on_selected_context(event):
+    """gdb.events.selected_context listener: fires whenever the user
+    changes gdb's selected inferior/thread/frame (via 'thread', 'frame',
+    'inferior', or equivalent). If that leaves some OTHER gdb thread
+    still in the 'bthread switch'-ed state, auto-restore it -- so simply
+    moving on with 'thread <n>' is enough, no manual 'bthread restore'
+    needed.
+
+    Only available on gdb releases new enough to have
+    'gdb.events.selected_context' (added upstream in 2026; most
+    currently-deployed gdb versions do NOT have it yet). See
+    '_on_before_prompt' below for the fallback used otherwise.
+    """
+    new_thread = getattr(event, "thread", None)
+    new_key = new_thread.global_num if new_thread is not None else None
+    _auto_restore_all("because you switched away from it", keep_key=new_key)
+
+
+# Tracks the gdb global thread id selected the last time we checked, for
+# the '_on_before_prompt' polling fallback below. Only meaningful when
+# 'gdb.events.selected_context' doesn't exist.
+_last_selected_thread_key = "__unset__"
+
+
+def _on_before_prompt():
+    """Fallback for gdb releases without 'gdb.events.selected_context'
+    (i.e. most currently-deployed versions -- that event was only added
+    upstream in 2026). 'before_prompt' fires right before gdb redisplays
+    its prompt, which happens after every command including 'thread
+    <n>', so polling the selected thread here and comparing against what
+    it was last time we checked detects the same "switched away from a
+    switched thread" case, just one command later than the real event
+    would.
+    """
+    global _last_selected_thread_key
+    if not _saved_thread_regs:
+        # Nothing switched, no point polling; also keeps this cheap.
+        _last_selected_thread_key = "__unset__"
+        return
+    try:
+        thr = gdb.selected_thread()
+    except gdb.error:
+        return
+    new_key = thr.global_num if (thr is not None and thr.is_valid()) else None
+    if new_key == _last_selected_thread_key:
+        return
+    _last_selected_thread_key = new_key
+    _auto_restore_all("because you switched away from it", keep_key=new_key)
+
+
+def _bthread_auto_restore_hook(command_name):
+    """Invoked (via the CLI 'hook-<command>' definitions at the bottom of
+    this file) right BEFORE gdb actually resumes the inferior for
+    'continue'/'step'/'next'/etc. This is the only safety net that runs
+    *before* resumption: gdb's Python 'events.cont' fires only *after*
+    the target has already resumed, too late to prevent a thread from
+    running with a bthread's borrowed registers.
+    """
+    _auto_restore_all("before '{}' resumes it".format(command_name))
+
+
+class BthreadSwitchCmd(gdb.Command):
+    """bthread switch <bthread_id> -- borrow a pthread to debug a bthread.
+
+    Repoint the CURRENTLY SELECTED gdb thread's CPU registers at a
+    suspended bthread's saved context, so that all native gdb inspection
+    commands operate on that bthread's stack, right away and with no
+    extra commands to remember. After switching you can use:
+        bt / bt full        backtrace, auto-capped to the real frames --
+                             the fcontext stack base has no unwind
+                             terminator, so this command lowers gdb's
+                             'backtrace limit' for you to hide the '?? ()'
+                             garbage frames past the bottom.
+        frame <N>           select a frame
+        info locals         local variables (incl. those in rbx/r12-r15)
+        info args           function arguments
+        p <expr> / ptype    evaluate expressions in the frame's scope
+    You do NOT need to remember to run 'bthread restore' -- switching
+    away, resuming, or switching to a different bthread all restore the
+    borrowed registers for you automatically (see AUTOMATIC RESTORE
+    below). Run 'bthread restore' manually only if you want the real
+    registers back immediately without doing one of those things.
+
+    ARGUMENTS
+        <bthread_id>   numeric bthread id, decimal or 0x-hex. Get it from
+                       'bthread ls', 'bthread search', or the id shown in
+                       information_schema / THD::m_created_bthread_id.
+
+    WHAT IS SWITCHED
+        The full System V AMD64 callee-saved set plus the frame regs:
+            rip, rsp, rbp, rbx, r12, r13, r14, r15
+        (read from the bthread's ContextualStack save area). Switching all
+        of them -- not just rip/rbp/rsp -- lets gdb recover locals that are
+        held in rbx/r12-r15, so 'info locals' is accurate.
+
+    REQUIREMENTS
+        LIVE PROCESS ONLY. This WRITES CPU registers, which a core file
+        does not support (use 'bthread bt' for a read-only unwind on
+        cores). Stop execution first (all threads stopped is fine).
+
+    AUTOMATIC RESTORE -- 'bthread restore' is now mostly OPTIONAL
+        Because gdb's 'backtrace limit' is a GLOBAL setting (not
+        per-thread), only ONE gdb thread is ever left switched at a time,
+        and its real registers are put back for you automatically when:
+          * You run 'bthread switch' again, on this or another gdb
+            thread -- the previously switched thread is auto-restored
+            first.
+          * You change gdb's selected thread ('thread <n>') -- caught via
+            gdb's 'selected_context' event on gdb releases that have it
+            (added upstream in 2026), or by polling on 'before_prompt'
+            (one command later) on older releases that don't.
+          * You resume the inferior at all ('continue'/'step'/'next'/
+            'finish'/'until'/'advance'/'run') -- caught via 'hook-<cmd>',
+            which runs *before* gdb actually resumes the target (unlike
+            the Python 'events.cont' notification, which only fires
+            *after* resuming -- too late to prevent it), so the CPU is
+            guaranteed to never actually execute with borrowed registers.
+        These three hooks together mean plain 'thread <n>' or 'continue'
+        is enough -- you never HAVE to type 'bthread restore'.
+
+    SAFETY -- READ THIS
+        * The automatic restore above covers the standard CLI commands
+          and the ordinary 'thread'/'frame' navigation. It does NOT
+          cover every conceivable way to resume the target -- e.g.
+          calling gdb.execute("continue") from your OWN Python/MI code,
+          or a command alias that bypasses hook-<realname>, will NOT be
+          intercepted. When in doubt, run 'bthread restore' explicitly.
+        * The original registers remain saved (and 'info locals' etc.
+          keep working) until one of the restore triggers above fires,
+          or you run 'bthread restore' yourself.
+
+    DECLINED CASES (nothing is switched, an explanation is printed)
+        * bthread runs on a pthread stack   -> just 'thread <n>' its LWP.
+        * bthread is currently running       -> its saved context is stale;
+          'thread <n>' to the owning LWP instead (see 'bthread bt').
+        * bthread has no stack               -> never scheduled, or already
+          finished and recycled.
+
+    EXAMPLE
+        (gdb) bthread switch 34359748649
+        (gdb) bt
+        (gdb) frame 14
+        (gdb) info locals
+        (gdb) bthread restore
+
+    SEE ALSO
+        bthread restore, bthread bt, bthread ls, bthread search, bthread arg
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(
+            self, "bthread switch", gdb.COMMAND_STACK, gdb.COMPLETE_NONE
+        )
+
+    def invoke(self, arg, tty):
+        arg = arg.strip()
+        if not arg:
+            print("usage: bthread switch <bthread_id>  (decimal or 0x-hex), "
+                  "see 'bthread ls'")
+            return
+        try:
+            bthread_id = int(arg, 0)
+        except ValueError:
+            print("invalid bthread_id: {}".format(arg))
+            return
+
+        thr = gdb.selected_thread()
+        if thr is None or not thr.is_valid():
+            print("no selected thread; run this on a live, stopped process")
+            return
+
+        # Verify we can write registers (fails cleanly on a core file).
+        try:
+            _ = gdb.selected_frame().read_register("rip")
+        except gdb.error as e:
+            print("cannot read registers ({}). This command needs a live, "
+                  "stopped process (not a core file).".format(e))
+            return
+
+        task_meta = get_one_bthread(bthread_id)
+        if task_meta is None:
+            print("bthread_id {} (0x{:x}) not found or stale".format(
+                bthread_id, bthread_id))
+            return
+
+        stack_type = int(task_meta["attr"]["stack_type"])
+        if stack_type == BTHREAD_STACKTYPE_PTHREAD:
+            print("bthread_id {} runs directly on a pthread; just select its "
+                  "LWP with 'thread <n>' -- no switch needed.".format(bthread_id))
+            return
+
+        running_thr = _find_running_lwp(bthread_id)
+        if running_thr is not None:
+            print("bthread_id {} is CURRENTLY RUNNING on gdb thread {}; its "
+                  "saved context is stale. Use 'thread {}' directly.".format(
+                      bthread_id, running_thr.num, running_thr.num))
+            return
+
+        ctx = _bthread_full_context(task_meta)
+        if ctx is None:
+            print("bthread_id {} has no saved stack (never scheduled or "
+                  "already recycled)".format(bthread_id))
+            return
+
+        key = thr.global_num
+
+        # 'backtrace limit' is a *global* gdb setting (not per-thread), so
+        # at most one gdb thread may be left in the switched state -- see
+        # the _saved_thread_regs comment above. If some OTHER thread is
+        # still switched, auto-restore it first (shared with the
+        # selected_context/hook-continue safety nets below).
+        _auto_restore_all(
+            "because gdb thread {} is switching to a different bthread".format(
+                thr.num),
+            keep_key=key,
+        )
+
+        if key in _saved_thread_regs:
+            print("gdb thread {} already switched to a bthread; switching "
+                  "it to a different bthread now (original registers stay "
+                  "saved for 'bthread restore').".format(thr.num))
+
+        try:
+            saved = _read_registers(_SWITCH_REGISTERS)
+            _saved_thread_regs.setdefault(key, (thr.num, saved))
+            _write_registers(ctx)
+        except gdb.error as e:
+            print("failed to switch registers: {}".format(e))
+            return
+
+        gdb.execute("flushregs", to_string=True)
+
+        # The fcontext stack base has no valid unwind terminator, so a bare
+        # 'bt' would spill hundreds of bogus '?? ()' frames past the real
+        # bottom. Cap gdb's global 'backtrace limit' to the genuine frame
+        # count, so plain 'bt'/'bt full'/'where' just work without needing
+        # a special command or an explicit count.
+        global _original_backtrace_limit
+        n = _valid_frame_count(ctx["rip"], ctx["rbp"])
+        if _original_backtrace_limit is None:
+            _original_backtrace_limit = _get_backtrace_limit()
+        _set_backtrace_limit(n)
+
+        print("gdb thread {}: registers pointed at bthread {} (0x{:x}).".format(
+            thr.num, bthread_id, bthread_id))
+        print("switched: rip/rsp/rbp/rbx/r12-r15 (full callee-saved set).")
+        print("backtrace limit capped to {} real frames (stack-base garbage "
+              "past that is hidden). 'bthread restore' undoes this too."
+              .format(n))
+        print("")
+        gdb.execute("bt", to_string=False)
+
+
+class BthreadRestoreCmd(gdb.Command):
+    """bthread restore -- manually undo a 'bthread switch' (usually optional).
+
+    Restore the currently selected gdb thread's original CPU registers
+    (rip, rsp, rbp, rbx, r12-r15) that were saved by 'bthread switch',
+    returning the thread to its real execution context. Once no gdb
+    thread is left switched, also restores gdb's global 'backtrace limit'
+    to whatever it was before the first 'bthread switch'.
+
+    YOU USUALLY DON'T NEED TO RUN THIS -- IT'S AUTOMATIC
+        The same restore logic now fires on its own in the situations
+        that used to require calling this by hand:
+          * Switching a DIFFERENT bthread ('bthread switch <id>' again,
+            same or another gdb thread) auto-restores whichever thread
+            was previously switched.
+          * Selecting a different gdb thread ('thread <n>') auto-restores
+            the thread you're leaving, via gdb's selected_context event.
+          * Resuming execution ('continue'/'step'/'next'/'finish'/'until'/
+            'advance'/'run') auto-restores EVERY still-switched thread
+            first, via 'hook-<command>', so the CPU never actually runs
+            with a borrowed bthread register set.
+        Manually running 'bthread restore' is now mainly useful if you
+        want to go back to the real registers immediately, without
+        performing one of the actions above (e.g. right before ending
+        the gdb session, or just to double check).
+
+    ARGUMENTS
+        none. Operates on the currently selected gdb thread. Select the
+        same thread you ran 'bthread switch' on before restoring.
+
+    NOTES
+        * If the selected thread was never switched, prints a notice and
+          does nothing.
+
+    SEE ALSO
+        bthread switch
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(
+            self, "bthread restore", gdb.COMMAND_STACK, gdb.COMPLETE_NONE
+        )
+
+    def invoke(self, arg, tty):
+        thr = gdb.selected_thread()
+        if thr is None or not thr.is_valid():
+            print("no selected thread")
+            return
+        result = _restore_saved_registers(thr.global_num)
+        if result is None:
+            print("gdb thread {} was not switched (nothing to restore)".format(
+                thr.num))
+            return
+        thr_num, ok = result
+        if not ok:
+            return  # error already printed by _restore_saved_registers
+
+        # Once no gdb thread is left switched, restore the original global
+        # backtrace limit that 'bthread switch' overrode.
+        if not _saved_thread_regs:
+            global _original_backtrace_limit
+            if _original_backtrace_limit is not None:
+                _set_backtrace_limit(_original_backtrace_limit)
+                _original_backtrace_limit = None
+
+        print("gdb thread {}: original registers restored.".format(thr_num))
+
+
+BthreadCmd()
+BthreadLsCmd()
+BthreadBtCmd()
+BthreadArgCmd()
+BthreadSearchCmd()
+BthreadSwitchCmd()
+BthreadRestoreCmd()
+InfoBthreadsCmd()
+
+# --- Automatic safety nets, so 'bthread restore' is optional in practice ---
+#
+# 1) gdb.events.selected_context fires synchronously right after the user
+#    changes the selected inferior/thread/frame (e.g. 'thread <n>'). This
+#    event was only added upstream in 2026, so most currently-deployed
+#    gdb builds don't have it yet ('_gdbevents' has no attribute
+#    'selected_context') -- fall back to polling on 'before_prompt',
+#    which exists in far older gdb releases, instead.
+if hasattr(gdb.events, "selected_context"):
+    gdb.events.selected_context.connect(_on_selected_context)
+else:
+    gdb.events.before_prompt.connect(_on_before_prompt)
+
+# 2) hook-<command> is gdb's pre-execution hook mechanism (CLI 'define
+#    hook-continue' etc.): unlike the Python 'events.cont' notification
+#    (which only fires *after* the inferior has already resumed, too
+#    late), these run *before* gdb actually resumes the target, so this
+#    is the only place we can restore borrowed registers in time to stop
+#    the CPU from ever running with them.
+for _hooked_cmd in ("continue", "step", "next", "finish", "until", "advance", "run"):
+    gdb.execute(
+        "define hook-{0}\n"
+        "python _bthread_auto_restore_hook({0!r})\n"
+        "end".format(_hooked_cmd),
+        to_string=True,
+    )
+del _hooked_cmd
+
+###
+### MySQL structure explore tools.
+###
 class TreeWalker(object):
     """A base class for tree traverse"""
 
@@ -439,6 +2063,17 @@ class ItemDisplayer(object):
         if item['field_name']:
             db_cata.append(item['field_name'].string())
         return 'field = ' + '.'.join(db_cata)
+    def show_Item_field(self, item):
+        field = item['field']
+        if not field or not field['field_name']:
+            return self.show_Item_ident(item)
+        field_info = []
+        if field['table']['alias']:
+            field_info.append(field['table']['alias'].string())
+        else:
+            field_info.append(field['table']['s']['table_name'].string())
+        field_info.append(field['field_name'].string())
+        return 'field = ' + '.'.join(field_info)
 
     def show_Item_int(self, item):
         return 'value = ' + str(item['value'])
@@ -446,7 +2081,8 @@ class ItemDisplayer(object):
     show_Item_float = show_Item_int
 
     def show_Item_string(self, item):
-        return 'value = ' + item['str_value']['m_ptr'].string()
+        ptr = item['str_value']['m_ptr']
+        return 'value = ' + (ptr.string() if ptr else '')
 
     def show_Item_decimal(self, item):
         sym = gdb.lookup_global_symbol('Item_decimal::val_real()')
@@ -940,12 +2576,12 @@ class OptPathTraverser(gdb.Command, TreeWalker):
 
     def walk_pq_opt_Path(self, val):
         subpaths = []
-        subpath1 = val['subpath1']
+        subpath1 = val['m_subpath1']
         if subpath1:
             subpaths.append(subpath1)
         else:
             return subpaths
-        subpath2 = val['subpath2']
+        subpath2 = val['m_subpath2']
         if subpath2:
             subpaths.append(subpath2)
         return subpaths
@@ -959,16 +2595,15 @@ class OptPathTraverser(gdb.Command, TreeWalker):
         return array[apindex]
 
     def show_pq_opt_Path(self, val):
-        distinfo = val['distinfo']
+        distinfo = val['m_distinfo']
         self.distinfo_to_str(distinfo)
-        apindex = int(val['access_path_state'])
-        access_type = str(apindex)
-        #access_path =
-        #self.context['m_access_path_state']['m_array'][apindex]['access_path']
+        apindex = int(val['m_access_path_state'])
         access_path = self.get_access_path(apindex)['access_path']
-        access_type = str(access_path['type']).split('::')[-1]
-        access_type += table_name_from_access_path(access_path)
-        return access_type + ': ' + self.distinfo_to_str(distinfo)
+        aptype = str(access_path['type']).split('::')[-1]
+        aptables = table_name_from_access_path(access_path)
+        return "{} ({}){}: {}".format(
+            aptype, self.autoncvar.set_var(access_path), aptables,
+            self.distinfo_to_str(distinfo))
 OptPathTraverser()
 
 class MDL_traverser(gdb.Command):
